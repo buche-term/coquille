@@ -1,0 +1,99 @@
+<style>
+  .cq-install {
+    color-scheme: light dark;
+    --muted: color-mix(in srgb, currentColor 60%, transparent);
+    --line: color-mix(in srgb, currentColor 18%, transparent);
+    --accent: #3b82f6;
+    --danger: #e5484d;
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 12px 14px;
+    max-width: 640px;
+  }
+  .cq-install h1 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+  .cq-install p { margin: 0 0 10px; color: var(--muted); }
+  .cq-install code, .cq-install pre { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .cq-install code { color: CanvasText; }
+  .cq-install .tools { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 12px; padding: 0; list-style: none; }
+  .cq-install .tools li { border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; }
+  .cq-install .buttons { display: flex; gap: 8px; align-items: center; }
+  .cq-install button {
+    font: inherit; padding: 4px 14px; border-radius: 5px; cursor: pointer;
+    border: 1px solid var(--line); background: transparent; color: inherit;
+  }
+  .cq-install button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  .cq-install button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .cq-install .hint { color: var(--muted); font-size: 12px; }
+
+  /* States: the prompt (default), .busy (progress), .message (a final note). */
+  .cq-install .progress, .cq-install .message { display: none; }
+  .cq-install.busy .buttons { display: none; }
+  .cq-install.busy .progress { display: block; }
+  .cq-install.message .prompt, .cq-install.message .progress { display: none; }
+  .cq-install.message .message { display: block; }
+
+  .cq-install .stage { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+  .cq-install .amount { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .cq-install .bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  .cq-install .fill { height: 100%; width: 0; background: var(--accent); transition: width 0.15s linear; }
+  .cq-install .bar.indeterminate .fill { width: 30%; animation: cq-slide 1.1s ease-in-out infinite; }
+  @keyframes cq-slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+
+  .cq-install .message.error h1 { color: var(--danger); }
+  .cq-install .message pre {
+    margin: 6px 0 0; padding: 8px 10px; border-radius: 5px; border: 1px solid var(--line);
+    white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto;
+  }
+  .cq-install .message pre:empty { display: none; }
+</style>
+<div class="cq-install" id="cq-install" tabindex="-1">
+  <div class="prompt">
+    <h1>cq is not installed on <code data-field="host"></code></h1>
+    <p>Install coquille <span data-field="version"></span> (<code data-field="target"></code>)
+      into <code>~/.local/bin</code> on that host? The release is downloaded here and copied over ssh.</p>
+    <ul class="tools"><li>cq</li><li>stdembed</li><li>sel</li><li>watch</li><li>+ssh</li></ul>
+    <div class="buttons">
+      <button class="primary" id="prime-focus" autofocus onclick="buche({action: 'install'})">Install</button>
+      <button onclick="buche({action: 'cancel'})">Cancel</button>
+      <span class="hint">Enter to install, Escape to cancel</span>
+    </div>
+    <div class="progress">
+      <div class="stage"><span class="label"></span><span class="amount"></span></div>
+      <div class="bar"><div class="fill"></div></div>
+    </div>
+  </div>
+  <div class="message"><h1></h1><pre></pre></div>
+</div>
+<script>
+  (() => {
+    const root = document.getElementById("cq-install");
+    const $ = (sel) => root.querySelector(sel);
+    const mb = (n) => (n / 1048576).toFixed(1);
+    const prompting = () => !root.classList.contains("busy") && !root.classList.contains("message");
+    root.addEventListener("keydown", (e) => {
+      if (!prompting()) return;
+      if (e.key === "Escape") { e.preventDefault(); buche({action: "cancel"}); }
+    });
+    window.cqInstall = {
+      // The install prompt.
+      init(d) {
+        for (const el of root.querySelectorAll("[data-field]")) el.textContent = d[el.dataset.field];
+        root.className = "cq-install";
+      },
+      progress(d) {
+        root.className = "cq-install busy";
+        $(".label").textContent = d.label;
+        const known = d.total > 0 && d.done != null;
+        $(".bar").classList.toggle("indeterminate", !known);
+        $(".fill").style.width = known ? `${Math.min(100, (100 * d.done) / d.total)}%` : "";
+        $(".amount").textContent = known ? `${mb(d.done)} / ${mb(d.total)} MB` : "";
+      },
+      // A final note (an error, or the usage): replaces whatever was shown.
+      message(d) {
+        root.className = "cq-install message";
+        $(".message").classList.toggle("error", !!d.error);
+        $(".message h1").textContent = d.title;
+        $(".message pre").textContent = d.detail || "";
+      },
+    };
+  })();
+</script>

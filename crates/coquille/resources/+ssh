@@ -1,0 +1,8 @@
+#!/bin/sh
+# Cargo binary names cannot contain '+', so the +ssh command is built as
+# cq-ssh. This shim forwards to the cq-ssh installed next to it.
+here=$(dirname "$0")
+if [ -x "$here/cq-ssh" ]; then
+    exec "$here/cq-ssh" "$@"
+fi
+exec cq-ssh "$@"

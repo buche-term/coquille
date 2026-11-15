@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A shell for the Buche terminal, with the sel, watch, and stdembed companion tools"
+description = "A shell for the Buche terminal, with the sel, watch, stdembed and +ssh companion tools"
 
 # The shell itself. The companion tools live in src/utilities/ and are built
 # as separate binaries, but shipped in the same package (and the same archive).
@@ -21,8 +21,17 @@ name = "stdembed"
 path = "src/utilities/stdembed.rs"
 
 [[bin]]
+# Cargo forbids '+' in binary names: the `+ssh` command is the
+# resources/+ssh shim, shipped next to the binaries (see package.metadata.dist).
+name = "cq-ssh"
+path = "src/utilities/ssh.rs"
+
+[[bin]]
 name = "watch"
 path = "src/utilities/watch.rs"
+
+[package.metadata.dist]
+include = ["resources/+ssh"]
 
 [dependencies]
 anyhow = "1"

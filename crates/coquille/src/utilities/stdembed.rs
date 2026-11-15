@@ -41,6 +41,35 @@ static MASTER_FD: AtomicI32 = AtomicI32::new(-1);
 static ENV_ROWS: AtomicI32 = AtomicI32::new(-1);
 static ENV_COLS: AtomicI32 = AtomicI32::new(-1);
 
+/// The readiness handshake. The wrapping end (-w) announces itself with an
+/// empty frame on fd 0 (READY_FD) as soon as it is set up, its terminal in
+/// raw mode. Until the unwrapping end (-u) has seen a frame (that one, or
+/// any other: an older -w sends no announcement, but its frames mean it runs
+/// too), it leaves fd3/fd5 input unread: sent earlier, it would reach a
+/// remote terminal still in cooked mode (a login shell starting, say), to be
+/// echoed back as text and then flushed. After READY_TIMEOUT, it stops
+/// waiting (a channel without -w at the other end).
+///
+/// Writing the empty fd-0 frame is a no-op for an -u that predates this.
+const READY_FD: i32 = 0;
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+static PEER_READY: AtomicBool = AtomicBool::new(false);
+
+fn ready_frame() -> Vec<u8> {
+    let mut frame = start_seq(READY_FD);
+    frame.extend_from_slice(&END_SEQ);
+    frame
+}
+
+/// Where -u sends a frame from the channel: to its local fd (the ready
+/// announcement goes nowhere), and either way, the other end is up.
+fn unwrap_sink(n: i32, d: &[u8]) {
+    PEER_READY.store(true, Ordering::SeqCst);
+    if n != READY_FD {
+        write_once(n as RawFd, d);
+    }
+}
+
 extern "C" fn record_sig(sig: c_int) {
     LAST_SIG.store(sig, Ordering::SeqCst);
 }
@@ -451,6 +480,11 @@ fn pump_extra_fds(w: &Arc<LockedWriter>, done: &AtomicBool) {
             watches.push(fd);
         }
     }
+    // Leave fd3/fd5 input queued until the other end is up (see PEER_READY).
+    let since = std::time::Instant::now();
+    while !PEER_READY.load(Ordering::SeqCst) && !done.load(Ordering::SeqCst) && since.elapsed() < READY_TIMEOUT {
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
     while !watches.is_empty() && !done.load(Ordering::SeqCst) {
         let mut pfds: Vec<libc::pollfd> = watches
             .iter()
@@ -663,7 +697,7 @@ fn run_unwrap_pipe(cmd: &[OsString]) -> ! {
                 parser.feed(
                     &chunk,
                     &mut |d| w.write(d),
-                    &mut |n, d| write_once(n as RawFd, d),
+                    &mut |n, d| unwrap_sink(n, d),
                 );
             }
             done.store(true, Ordering::SeqCst);
@@ -729,7 +763,7 @@ fn run_unwrap_pty(cmd: &[OsString]) -> ! {
                 parser.feed(
                     &chunk,
                     &mut |d| w.write(d),
-                    &mut |n, d| write_once(n as RawFd, d),
+                    &mut |n, d| unwrap_sink(n, d),
                 );
             }
             done.store(true, Ordering::SeqCst);
@@ -797,6 +831,7 @@ fn run_wrap_pipe(
 
     let w_out = LockedWriter::new(1);
     let w_in = LockedWriter::new(cin_w);
+    w_out.write(&ready_frame());
 
     {
         let (w, fd) = (w_out.clone(), cout_r);
@@ -885,6 +920,7 @@ fn run_wrap_pty(
     let w_out = LockedWriter::new(1);
     let w_master = LockedWriter::new(master);
     let old = grab_raw_stdin();
+    w_out.write(&ready_frame());
 
     {
         let (w, fd) = (w_out.clone(), master);

@@ -664,14 +664,6 @@ impl Shell {
             "icon": logo(),
             "bindings": bindings,
         })));
-        // This shell's own tab is its prompt, not a cell: the placeholder the
-        // terminal shows for our process in the enclosing shell's stream, if
-        // any (locally ["$proc", "?"] — the enclosing shell re-addresses it to
-        // the placeholder of the process it spawned us as), goes away on its
-        // own once spent. Then mark it spent. A no-op visually at top level,
-        // where there is no such placeholder.
-        self.emit(json!({ "type": "configure", "from": ["$proc", "?"], "to": ["$term"], "ephemeral": true }));
-        self.emit(close_message(&["$proc".into(), "?".into()], true, Some(0)));
     }
 
     // The configuration
