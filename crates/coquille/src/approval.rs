@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::util::{is_executable, resolve, sha256_hex};
+use crate::util::{is_executable, path_dirs, resolve, sha256_hex};
 
 /// An approved file: its full path, and its SHA-256 (hex), or None for any
 /// content.
@@ -51,9 +51,7 @@ pub fn resolve_executable(cmd: &str, path: &str, cwd: &Path) -> Option<PathBuf> 
     if cmd.contains('/') {
         return Some(resolve(cwd, cmd));
     }
-    path.split(':')
-        .map(|dir| resolve(cwd, if dir.is_empty() { "." } else { dir }).join(cmd))
-        .find(|candidate| is_executable(candidate))
+    path_dirs(path, cwd).map(|dir| dir.join(cmd)).find(|candidate| is_executable(candidate))
 }
 
 thread_local! {

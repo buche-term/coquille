@@ -38,11 +38,68 @@ pub struct DaemonSpec {
     pub config_dir: String,
 }
 
-/// The prompt actions coquille implements itself (`{builtin: <name>}`).
-pub const BUILTIN_ACTIONS: &[&str] = &["submit", "run", "previous", "next", "complete", "close", "requests"];
+/// A prompt action coquille implements itself (`{builtin: <name>}`; see
+/// Shell::handle_command for what each does).
+pub struct BuiltinAction {
+    pub name: &'static str,
+    /// Whether it freezes the prompt by default when it fires.
+    pub freezes: bool,
+    /// What the terminal shows for a binding to it (in its help, say), unless
+    /// the binding says otherwise (see with_builtin_help).
+    pub title: &'static str,
+    pub description: &'static str,
+}
 
-/// Actions that freeze the prompt by default when they fire.
-const FREEZING_ACTIONS: &[&str] = &["submit", "close"];
+/// The prompt actions coquille implements itself.
+pub const BUILTIN_ACTIONS: &[BuiltinAction] = &[
+    BuiltinAction {
+        name: "submit",
+        freezes: true,
+        title: "Run the command",
+        description: "Run what is typed, and add it to the history",
+    },
+    BuiltinAction {
+        name: "run",
+        freezes: false,
+        title: "Run, out of the history",
+        description: "Run what is typed, without adding it to the history",
+    },
+    BuiltinAction {
+        name: "previous",
+        freezes: false,
+        title: "Previous command",
+        description: "Go back in the history",
+    },
+    BuiltinAction {
+        name: "next",
+        freezes: false,
+        title: "Next command",
+        description: "Go forward in the history",
+    },
+    BuiltinAction {
+        name: "complete",
+        freezes: false,
+        title: "Complete",
+        description: "Complete what is typed at the cursor",
+    },
+    BuiltinAction {
+        name: "close",
+        freezes: true,
+        title: "Close the shell",
+        description: "End the shell, and its prompt",
+    },
+    BuiltinAction {
+        name: "requests",
+        freezes: false,
+        title: "Pending requests",
+        description: "Show the requests waiting for an answer",
+    },
+];
+
+/// The built-in action called `name`, if there is one.
+pub fn builtin_action(name: &str) -> Option<&'static BuiltinAction> {
+    BUILTIN_ACTIONS.iter().find(|a| a.name == name)
+}
 
 /// A problem with the configuration: what was skipped, and where.
 #[derive(Clone, Debug)]
@@ -291,6 +348,18 @@ fn parse_env_entry(raw: &Value) -> Result<EnvEntry, String> {
 /// terminal's help to file them under: e.g. a toggle for all of them.
 const OWN_CATEGORY: &str = "cq";
 
+/// Give a (validated) binding to a built-in action the action's title and
+/// description (see BUILTIN_ACTIONS), where it has none of its own.
+fn with_builtin_help(binding: &mut Value) {
+    let Some(obj) = binding.as_object_mut() else { return };
+    let Some(action) = obj.get("builtin").and_then(Value::as_str).and_then(builtin_action) else { return };
+    for (name, text) in [("title", action.title), ("description", action.description)] {
+        if !obj.contains_key(name) {
+            obj.insert(name.into(), json!(text));
+        }
+    }
+}
+
 /// Put a (validated) binding in OWN_CATEGORY, first, along with its own.
 fn with_own_category(binding: &mut Value) {
     let Some(obj) = binding.as_object_mut() else { return };
@@ -342,11 +411,12 @@ pub fn parse_action(raw: &Value) -> Result<Value, String> {
             action.insert("freeze".into(), json!(freeze));
         }
     } else {
-        let name = obj["builtin"].as_str().filter(|n| BUILTIN_ACTIONS.contains(n)).ok_or_else(|| {
-            format!("unknown builtin {} (expected one of: {})", obj["builtin"], BUILTIN_ACTIONS.join(", "))
+        let builtin = obj["builtin"].as_str().and_then(builtin_action).ok_or_else(|| {
+            let names: Vec<&str> = BUILTIN_ACTIONS.iter().map(|a| a.name).collect();
+            format!("unknown builtin {} (expected one of: {})", obj["builtin"], names.join(", "))
         })?;
-        action.insert("builtin".into(), json!(name));
-        action.insert("freeze".into(), json!(freeze.unwrap_or(FREEZING_ACTIONS.contains(&name))));
+        action.insert("builtin".into(), json!(builtin.name));
+        action.insert("freeze".into(), json!(freeze.unwrap_or(builtin.freezes)));
     }
     if inherit {
         action.insert("inherit".into(), json!(true));
@@ -825,6 +895,7 @@ fn apply_entry(config: &mut ResolvedConfig, entry: &ConfigEntry, problems: &mut 
         }
         match parse_action(&raw) {
             Ok(mut binding) => {
+                with_builtin_help(&mut binding);
                 with_own_category(&mut binding);
                 config.bindings.insert(key, binding);
             }
@@ -878,9 +949,22 @@ mod tests {
         let env = HashMap::from([("XDG_CONFIG_HOME".to_owned(), dir.to_string_lossy().into_owned())]);
         let config = load_config(&dir, &env);
         assert!(config.errors.is_empty(), "{:?}", config.errors);
-        let enter = json!({"builtin": "submit", "freeze": true, "categories": ["cq"]});
+        let enter = json!({
+            "builtin": "submit",
+            "freeze": true,
+            "title": "Run the command",
+            "description": "Run what is typed, and add it to the history",
+            "categories": ["cq"],
+        });
         assert_eq!(config.bindings["Enter"], enter);
-        assert_eq!(config.bindings["Tab"], json!({"builtin": "complete", "freeze": false, "categories": ["cq"]}));
+        let tab = json!({
+            "builtin": "complete",
+            "freeze": false,
+            "title": "Complete",
+            "description": "Complete what is typed at the cursor",
+            "categories": ["cq"],
+        });
+        assert_eq!(config.bindings["Tab"], tab);
         assert_eq!(config.history_size, 10000);
         assert_eq!(config.prompt.vars, vec![("COLOR".to_owned(), "${HOSTNAME|hue}".to_owned())]);
         assert_eq!(config.prompt.parts.len(), 4);
@@ -915,6 +999,23 @@ mod tests {
         );
         assert!(parse_action(&json!({"command": "x", "categories": "files"})).is_err());
         assert!(parse_action(&json!({"command": "x", "categories": [""]})).is_err());
+    }
+
+    #[test]
+    fn builtin_bindings_say_what_they_do() {
+        // The action's own title and description, unless the binding has
+        // its own (each on its own).
+        let mut b = parse_action(&json!({"builtin": "close", "title": "Quit"})).unwrap();
+        with_builtin_help(&mut b);
+        assert_eq!(
+            b,
+            json!({"builtin": "close", "freeze": true, "title": "Quit", "description": "End the shell, and its prompt"})
+        );
+        // Not for a command, nor in what parse_action makes of an action.
+        let mut b = parse_action(&json!("ls")).unwrap();
+        with_builtin_help(&mut b);
+        assert_eq!(b, json!({"command": "ls"}));
+        assert_eq!(parse_action(&json!({"builtin": "next"})), Ok(json!({"builtin": "next", "freeze": false})));
     }
 
     #[test]

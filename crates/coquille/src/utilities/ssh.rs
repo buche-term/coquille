@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio, exit};
 use std::time::{Duration, Instant};
 
+use coquille::channel::{control_fd, wait_fd, write_line};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -140,13 +141,31 @@ fn probe(ui: &Ui, host: &str) -> (String, String, Status) {
     (os.to_string(), arch.to_string(), status)
 }
 
-/// The release target triple for a `uname -s` / `uname -m` pair.
+/// dist's configuration, which lists the release targets (`targets`).
+const DIST_CONFIG: &str = include_str!("../../../../dist-workspace.toml");
+
+/// The targets there are releases for (Rust target triples): `targets` in
+/// DIST_CONFIG (a one-line list of quoted strings, as dist writes it).
+fn release_targets() -> Vec<&'static str> {
+    let line = DIST_CONFIG.lines().find_map(|l| l.trim().strip_prefix("targets")?.trim_start().strip_prefix('='));
+    line.unwrap_or_default().split('"').skip(1).step_by(2).collect()
+}
+
+/// The release target for a `uname -s` / `uname -m` pair: the first listed
+/// for that architecture and OS.
 fn target_for(os: &str, arch: &str) -> Option<&'static str> {
-    match (os, arch) {
-        ("Linux", "x86_64" | "amd64") => Some("x86_64-unknown-linux-musl"),
-        ("Darwin", "arm64" | "aarch64") => Some("aarch64-apple-darwin"),
-        _ => None,
-    }
+    let arch = match arch {
+        "amd64" => "x86_64",
+        "arm64" => "aarch64",
+        arch => arch,
+    };
+    let os = match os {
+        "Linux" => "-linux-",
+        "Darwin" => "-apple-darwin",
+        _ => return None,
+    };
+    let for_host = |rest: &str| rest.starts_with('-') && rest.contains(os);
+    release_targets().into_iter().find(|t| t.strip_prefix(arch).is_some_and(for_host))
 }
 
 /// Where `+ssh` speaks: a GUI cell in buche (through the control channel),
@@ -161,36 +180,6 @@ const DIALOG: [&str; 2] = ["$proc", "install"];
 const DIALOG_HTML: &str = include_str!("../../resources/ssh-install.html");
 
 const THROTTLE: Duration = Duration::from_millis(100);
-
-/// The control channel, if there is one.
-fn control_fd() -> Option<RawFd> {
-    let fd: RawFd = env::var("BUCHE_CONTROL_FD").ok()?.parse().ok()?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(fd)
-}
-
-fn wait_fd(fd: RawFd, events: libc::c_short) {
-    let mut pfd = libc::pollfd { fd, events, revents: 0 };
-    unsafe { libc::poll(&mut pfd, 1, -1) };
-}
-
-/// Writes one line on a file descriptor (which may be non-blocking).
-fn write_line(fd: RawFd, line: &str) {
-    let mut data = line.as_bytes().to_vec();
-    data.push(b'\n');
-    let mut written = 0;
-    while written < data.len() {
-        let n = unsafe { libc::write(fd, data[written..].as_ptr().cast(), data.len() - written) };
-        if n >= 0 {
-            written += n as usize;
-            continue;
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::EAGAIN) | Some(libc::EINTR) => wait_fd(fd, libc::POLLOUT),
-            _ => return,
-        }
-    }
-}
 
 /// Reads one line from a file descriptor, a byte at a time: whatever
 /// follows it is left for stdembed, which takes the channel over afterwards.
@@ -550,4 +539,26 @@ fn main() {
         .arg(shell("bash -l", run))
         .exec();
     ui.fail("Could not run stdembed", err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn targets_come_from_dist() {
+        assert_eq!(target_for("Linux", "x86_64"), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(target_for("Darwin", "arm64"), Some("aarch64-apple-darwin"));
+        assert_eq!(target_for("Darwin", "x86_64"), None);
+        // Every release has a host it is for, which `uname` names.
+        let targets = release_targets();
+        assert!(!targets.is_empty());
+        for target in targets {
+            let found = ["Linux", "Darwin"]
+                .iter()
+                .flat_map(|os| ["x86_64", "aarch64"].map(|arch| target_for(os, arch)))
+                .any(|t| t == Some(target));
+            assert!(found, "no `uname` for the release target {target} (see target_for)");
+        }
+    }
 }

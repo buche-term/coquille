@@ -2,14 +2,13 @@
 //! completion. Highlighting tokenizes loosely (the line is usually
 //! incomplete: an unclosed quote is highlighted as the string it will be).
 
-use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::builtins::{BUILTIN_NAMES, is_builtin};
-use crate::util::{cwd, expand_home, home, is_executable, resolve};
+use crate::util::{cwd, expand_home, home, is_executable, path_dirs, resolve};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
@@ -80,7 +79,7 @@ fn cmd_exists(cmd: &str, path: &str) -> bool {
     if cmd.contains('/') {
         return is_executable(&resolve(&cwd(), cmd));
     }
-    path.split(':').filter(|d| !d.is_empty()).any(|dir| is_executable(&Path::new(dir).join(cmd)))
+    path_dirs(path, &cwd()).any(|dir| is_executable(&dir.join(cmd)))
 }
 
 fn fs_path_exists(arg: &str) -> bool {
@@ -252,7 +251,7 @@ pub fn shell_complete(text: &str, position: usize, path: &str) -> Vec<String> {
             BUILTIN_NAMES.iter().filter(|b| b.starts_with(prefix)).map(|b| b.to_string()).collect();
         builtins.sort();
         let mut executables = std::collections::BTreeSet::new();
-        for dir in path.split(':').filter(|d| !d.is_empty()) {
+        for dir in path_dirs(path, &cwd()) {
             let Ok(entries) = std::fs::read_dir(dir) else { continue };
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
@@ -266,8 +265,9 @@ pub fn shell_complete(text: &str, position: usize, path: &str) -> Vec<String> {
     }
 
     let home = home().to_string_lossy().into_owned();
-    let tilde = prefix.starts_with('~');
-    let expanded = if tilde { format!("{home}{}", &prefix[1..]) } else { prefix.to_owned() };
+    // (Shown again as typed: see below.)
+    let tilde = prefix == "~" || prefix.starts_with("~/");
+    let expanded = expand_home(prefix);
     let pattern = format!("{}*", glob::Pattern::escape(&expanded));
     let options = glob::MatchOptions {
         require_literal_leading_dot: !prefix.rsplit('/').next().unwrap_or("").starts_with('.'),

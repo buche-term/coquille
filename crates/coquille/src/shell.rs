@@ -20,9 +20,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::{JoinHandle, spawn_local};
 
-use crate::approval::{ControlCommand, approve};
+use crate::approval::approve;
 use crate::builtins::{BuiltinEvent, builtin_events, is_builtin};
-use crate::config::{ConfigError, PromptSpec, load_config, parse_action};
+use crate::config::{ConfigError, ResolvedConfig, load_config, parse_action};
 use crate::config_watch::{FileChange, Snapshot, changes, snapshot};
 use crate::expand::{expand_env_vars, parse_program};
 use crate::highlight::{common_prefix, shell_complete, shell_highlight, word_before};
@@ -34,7 +34,7 @@ use crate::process::{Delegate, Delegations, Process, ProcessOptions, Redirect, a
 use crate::prompt::{prompt_context, prompt_marker, render_prompt};
 use crate::requests::{Answer, PendingRequest, REQUESTS_HTML, pending_summary, render_requests};
 use crate::trust::{TrustedFile, trust, was_trusted};
-use crate::util::{address_of, cwd, merged, put_opt, tildify, utf16_len, utf16_to_byte};
+use crate::util::{address_of, cwd, merged, put_opt, relative, tildify, utf16_len, utf16_to_byte};
 
 /// How many runs are remembered, to be run again (see Shell::rerun).
 const MAX_RUNS: usize = 1000;
@@ -101,16 +101,12 @@ struct NavState {
     draft: String,
 }
 
-/// What to run (see Shell::submit): a command line, or a parsed command.
-#[derive(Clone, Default)]
-struct SubmitRequest {
-    /// A command line, to parse.
-    text: Option<String>,
-    /// Or a parsed command, and its redirections and variables.
-    command: Option<(String, Vec<String>)>,
-    redirects: Vec<Redirect>,
-    env: Vec<(String, String)>,
-
+/// Where a `command` request comes from, and where what it runs shows: what
+/// each process it starts is declared with (see Shell::declare). Passed down
+/// as it is to all of them (but for the `@zone` of a command line, and the
+/// focus, which only the first one takes).
+#[derive(Clone, Debug, Default)]
+struct Origin {
     /// The id of the terminal's "command" request, if any.
     id: Option<Value>,
     /// Where what the command shows goes.
@@ -123,6 +119,32 @@ struct SubmitRequest {
     /// a command submitted by another one (sel, say), which the terminal
     /// didn't send, so has no `id` to expect.
     focus: bool,
+}
+
+impl Origin {
+    /// The origin a `command` message gives (from the terminal, from a
+    /// control command, or `cq -c`, which only has the text).
+    fn from_message(msg: &Value) -> Self {
+        Origin {
+            id: msg.get("id").filter(|v| !v.is_null()).cloned(),
+            zone: msg.get("zone").and_then(Value::as_str).map(str::to_owned),
+            // (Nothing if it has none, or not an address.)
+            anchor: address_of(msg.get("anchor")).filter(|a| !a.is_empty()).map(|a| json!(a)),
+            focus: msg.get("focus") == Some(&Value::Bool(true)),
+        }
+    }
+}
+
+/// What to run (see Shell::submit): a command line, or a parsed command.
+#[derive(Clone, Default)]
+struct SubmitRequest {
+    /// A command line, to parse.
+    text: Option<String>,
+    /// Or a parsed command, and its redirections and variables.
+    command: Option<(String, Vec<String>)>,
+    redirects: Vec<Redirect>,
+    env: Vec<(String, String)>,
+
     /// Whether to record `text` in the history.
     history: bool,
     /// Whether to decorate the command's cell with its echo (not when
@@ -138,28 +160,18 @@ struct SubmitRequest {
 }
 
 impl SubmitRequest {
-    /// The request a `command` message makes (from the terminal, from a
-    /// control command, or `cq -c`, which only has the text).
+    /// The request a `command` message makes (see Origin::from_message for
+    /// where it comes from).
     fn from_message(msg: &Value) -> Self {
         let field = |name: &str| msg.get(name).and_then(Value::as_str).map(str::to_owned);
         SubmitRequest {
             text: field("text"),
-            id: msg.get("id").filter(|v| !v.is_null()).cloned(),
-            zone: field("zone"),
-            anchor: anchor_field(msg),
-            focus: msg.get("focus") == Some(&Value::Bool(true)),
             history: true,
             echo: msg.get("echo_html") != Some(&Value::Null),
             prompt_color: field("prompt_color"),
             ..Default::default()
         }
     }
-}
-
-/// A request's `anchor`, as the `configure` of what it shows carries it:
-/// nothing if it has none (or not an address).
-fn anchor_field(msg: &Value) -> Option<Value> {
-    address_of(msg.get("anchor")).filter(|a| !a.is_empty()).map(|a| json!(a))
 }
 
 /// A configuration problem, for the terminal.
@@ -288,12 +300,14 @@ pub struct Shell {
     /// The prompt text (host, path, branch), without the time: see
     /// prompt_context, prompt_marker.
     prompt_look: RefCell<Option<Vec<Value>>>,
-    /// Key chord → what it does (from the configuration).
-    bindings: RefCell<IndexMap<String, Value>>,
-    /// The programs that may address the shell (see approval.rs).
-    control_commands: RefCell<Vec<ControlCommand>>,
-    /// How the prompt looks (from the configuration).
-    prompt_spec: RefCell<PromptSpec>,
+    /// The configuration, as loaded last (see apply_config): the prompt's
+    /// look and bindings, the control commands (see approval.rs), the files
+    /// it depends on... Of those that need the user's trust (a directory's:
+    /// see trust.rs), `untrusted` are those that weren't applied (present,
+    /// but not trusted with what they hold): what the trust request asks
+    /// about (but those ignored), kept up to date as they change (see
+    /// check_config).
+    config: RefCell<ResolvedConfig>,
     /// The files the loaded configuration depends on, as they were loaded.
     config_snapshot: RefCell<Option<Snapshot>>,
     /// The pending request to reload the configuration, if its files
@@ -303,13 +317,6 @@ pub struct Shell {
     requests_view: RefCell<Option<String>>,
     /// A version of the configuration files the user chose not to load.
     ignored_version: RefCell<Option<String>>,
-    /// The files of the configuration that need the user's trust (a
-    /// directory's: see trust.rs), those of them that were applied
-    /// (trusted), and those that weren't: present, but not trusted with what
-    /// they hold — what the trust request asks about (but those ignored).
-    local_files: RefCell<HashSet<String>>,
-    trusted_files: RefCell<HashSet<String>>,
-    untrusted: RefCell<Vec<TrustedFile>>,
     /// The untrusted contents the user chose not to trust (for now): see
     /// TrustedFile::key.
     ignored_trust: RefCell<HashSet<String>>,
@@ -350,16 +357,11 @@ impl Shell {
             old_pwd: RefCell::default(),
             prompt_color: RefCell::default(),
             prompt_look: RefCell::default(),
-            bindings: RefCell::default(),
-            control_commands: RefCell::default(),
-            prompt_spec: RefCell::default(),
+            config: RefCell::default(),
             config_snapshot: RefCell::default(),
             config_request: RefCell::default(),
             requests_view: RefCell::default(),
             ignored_version: RefCell::default(),
-            local_files: RefCell::default(),
-            trusted_files: RefCell::default(),
-            untrusted: RefCell::default(),
             ignored_trust: RefCell::default(),
             watch_task: RefCell::default(),
             history: RefCell::new(ShellHistory::load()),
@@ -483,41 +485,27 @@ impl Shell {
         // Addressed to this shell itself. Some requests hold the input up
         // until they are done (`wait`: for --play scripts); the others run
         // as tasks, alongside what comes next.
-        match kind(&msg) {
-            "wait" | "shutdown" | "stdout_mode" | "nuke" | "daemon_set" | "daemon_enable" | "daemon_disable"
-            | "resize" => {
-                if let Err(err) = self.clone().handle(msg, None).await {
-                    self.emit(make_error(&err));
-                }
+        let holds_input = match kind(&msg) {
+            "wait" | "shutdown" | "stdout_mode" | "resize" => true,
+            _ => BuiltinEvent::from_message(&msg).is_some_and(|event| event.holds_input()),
+        };
+        if holds_input {
+            if let Err(err) = self.clone().handle(msg, None).await {
+                self.emit(make_error(&err));
             }
-            _ => {
-                let shell = self.clone();
-                self.spawn_task(async move { shell.handle(msg, None).await });
-            }
+        } else {
+            let shell = self.clone();
+            self.spawn_task(async move { shell.handle(msg, None).await });
         }
     }
 
     /// Handle a request to the shell itself, by type (from our parent, or
     /// from a process: see emit).
     async fn handle(self: Rc<Self>, msg: Message, process_id: Option<String>) -> Result<()> {
-        let str_field = |name: &str| match msg.get(name) {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Null) | None => String::new(),
-            Some(other) => other.to_string(),
-        };
+        if let Some(event) = BuiltinEvent::from_message(&msg) {
+            return self.perform(event, process_id.as_deref());
+        }
         match kind(&msg) {
-            "cd" => self.handle_cd(&str_field("path"), process_id.as_deref())?,
-            "set" => self.handle_set(&str_field("name"), &str_field("value"), msg.get("export") == Some(&Value::Bool(true))),
-            "nuke" => self.kill_all(),
-            "daemon_set" => {
-                let args = msg.get("args").and_then(Value::as_array).map_or(vec![], |a| {
-                    a.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned)).collect()
-                });
-                let restart = msg.get("restartMs").and_then(Value::as_u64);
-                self.daemon_set(&str_field("name"), &str_field("cmd"), args, restart);
-            }
-            "daemon_enable" => self.daemon_enable(&str_field("name")),
-            "daemon_disable" => self.daemon_disable(&str_field("name")),
             "parse" => self.handle_parse(&msg),
             "command" => self.handle_command(&msg).await?,
             "resize" => self.handle_resize(&msg),
@@ -578,9 +566,7 @@ impl Shell {
             "resize" if terminal => self.handle_resize(msg),
             "text" if terminal => proc.write_stdin(msg.get("text").and_then(Value::as_str).unwrap_or_default()),
             _ => {
-                let mut to = vec!["$proc".to_owned()];
-                to.extend_from_slice(rest);
-                proc.write_control(&merged(msg.clone(), json!({ "to": to })));
+                proc.write_control(&merged(msg.clone(), json!({ "to": relative(rest) })));
             }
         }
     }
@@ -627,7 +613,7 @@ impl Shell {
 
     /// The prompt's text and accent, as they are now (see render_prompt).
     fn render_prompt(&self) -> (Vec<Value>, String) {
-        let look = render_prompt(&self.prompt_spec.borrow(), &cwd().to_string_lossy(), &|name| self.lookup(name));
+        let look = render_prompt(&self.config.borrow().prompt, &cwd().to_string_lossy(), &|name| self.lookup(name));
         (look.parts, look.color)
     }
 
@@ -653,7 +639,8 @@ impl Shell {
         *self.prompt_color.borrow_mut() = Some(color.clone());
         *self.prompt_look.borrow_mut() = Some(parts);
         let dir = cwd().file_name().map_or("/".into(), |n| n.to_string_lossy().into_owned());
-        let bindings: Map<String, Value> = self.bindings.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let bindings: Map<String, Value> =
+            self.config.borrow().bindings.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         // (Its ✕ signals this shell: the terminal signals ["$proc"], the
         // group above it, once nothing else under it lives.)
         self.emit(prompt_configure(json!({
@@ -695,7 +682,8 @@ impl Shell {
         *self.env.borrow_mut() = env;
         self.vars.borrow_mut().clear();
 
-        let config = load_config(&here, &self.original_env);
+        let mut config = load_config(&here, &self.original_env);
+        let errors = std::mem::take(&mut config.errors);
         for (name, value) in &config.env {
             if value.export {
                 self.env.borrow_mut().insert(name.clone(), value.value.clone());
@@ -713,10 +701,17 @@ impl Shell {
             self.vars.borrow_mut().insert(name.clone(), value.clone());
         }
 
+        // The prompt picks the new bindings up from its next configure (see
+        // prompt_configure_full, which follows every reload).
+        self.history.borrow_mut().set_limit(config.history_size);
+        *self.config_snapshot.borrow_mut() = Some(snapshot(&config.files));
+        *self.ignored_version.borrow_mut() = None;
+        *self.config.borrow_mut() = config;
+
         // Reconcile the daemons: stop those that disappeared or changed,
         // start those that are new; leave the others alone. (The new ones are
         // checked against the control commands loaded with them.)
-        *self.control_commands.borrow_mut() = config.control_commands.clone();
+        let config = self.config.borrow();
         self.daemons.borrow_mut().retain(|name, daemon| {
             let same = config.daemons.get(name).is_some_and(|d| {
                 d.cmd == daemon.cmd && d.args == daemon.args && Some(&d.config_dir) == daemon.config_dir.as_ref()
@@ -740,24 +735,7 @@ impl Shell {
                 self.run_daemon(name);
             }
         }
-
-        // The prompt picks the new bindings up from its next configure (see
-        // prompt_configure_full, which follows every reload).
-        *self.bindings.borrow_mut() = config.bindings;
-        *self.prompt_spec.borrow_mut() = config.prompt;
-        self.history.borrow_mut().set_limit(config.history_size);
-        *self.config_snapshot.borrow_mut() = Some(snapshot(&config.files));
-        *self.ignored_version.borrow_mut() = None;
-        *self.local_files.borrow_mut() = config.local.into_iter().collect();
-        *self.trusted_files.borrow_mut() = config.trusted.into_iter().collect();
-        let mut untrusted: Vec<TrustedFile> = vec![];
-        for entry in config.untrusted {
-            if !untrusted.iter().any(|u| u.file == entry.file) {
-                untrusted.push(entry);
-            }
-        }
-        *self.untrusted.borrow_mut() = untrusted;
-        config.errors
+        errors
     }
 
     /// Poll the configuration files, to offer a reload when they change.
@@ -795,10 +773,13 @@ impl Shell {
         let Some(loaded) = self.config_snapshot.borrow().clone() else { return };
         let current = snapshot(loaded.files.keys());
         let changed = changes(&loaded, &current);
-        let unapplied = |file: &str| self.local_files.borrow().contains(file) && !self.trusted_files.borrow().contains(file);
+        let unapplied = |file: &str| {
+            let config = self.config.borrow();
+            config.local.iter().any(|f| f == file) && !config.trusted.iter().any(|f| f == file)
+        };
         if !changed.is_empty() && changed.iter().all(|c| unapplied(&c.file)) {
             {
-                let mut untrusted = self.untrusted.borrow_mut();
+                let untrusted = &mut self.config.borrow_mut().untrusted;
                 for FileChange { file, .. } in &changed {
                     untrusted.retain(|u| &u.file != file);
                     if let Some(Some(hash)) = current.files.get(file) {
@@ -866,7 +847,7 @@ impl Shell {
     /// didn't ignore (with what they hold).
     fn visible_untrusted(&self) -> Vec<TrustedFile> {
         let ignored = self.ignored_trust.borrow();
-        self.untrusted.borrow().iter().filter(|u| !ignored.contains(&u.key())).cloned().collect()
+        self.config.borrow().untrusted.iter().filter(|u| !ignored.contains(&u.key())).cloned().collect()
     }
 
     /// The trust request's id (None: none): it names what it asks about.
@@ -914,7 +895,7 @@ impl Shell {
     /// to approve or ignore each one from the keyboard (or with its buttons).
     /// The cell takes the focus (it repeats the command's id), and goes when
     /// closed (Escape), or when no request is left.
-    fn command_requests(self: &Rc<Self>, msg: &Message) {
+    fn command_requests(self: &Rc<Self>, origin: &Origin) {
         self.close_requests_view();
         let id = self.generate_process_id();
         *self.requests_view.borrow_mut() = Some(id.clone());
@@ -923,11 +904,11 @@ impl Shell {
             "type": "configure",
             "from": addr,
             "to": ["$term"],
-            "zone": msg.get("zone").filter(|z| z.is_string()).cloned().unwrap_or(Value::Null),
+            "zone": origin.zone.clone().map_or(Value::Null, Value::String),
         });
         let obj = configure.as_object_mut().unwrap();
-        put_opt(obj, "anchor", anchor_field(msg));
-        put_opt(obj, "id", msg.get("id").filter(|v| !v.is_null()).cloned());
+        put_opt(obj, "anchor", origin.anchor.clone());
+        put_opt(obj, "id", origin.id.clone());
         obj.insert("ephemeral".into(), json!(true));
         obj.insert("label".into(), styled_all("requests", "sans"));
         obj.insert("icon".into(), logo());
@@ -993,7 +974,7 @@ impl Shell {
         // trusted with what they hold now (the content the request was about).
         let accepted: Vec<TrustedFile> = changes
             .iter()
-            .filter(|c| self.trusted_files.borrow().contains(&c.file))
+            .filter(|c| self.config.borrow().trusted.contains(&c.file))
             .filter_map(|c| {
                 let hash = current.files.get(&c.file).cloned().flatten()?;
                 Some(TrustedFile { file: c.file.clone(), hash })
@@ -1149,7 +1130,8 @@ impl Shell {
             // (A daemon may address the shell if it is a control command, as
             // any other process.)
             let path = env.get("PATH").cloned().unwrap_or_default();
-            let approval = approve(&expand_env_vars(&daemon.cmd, &lookup), &path, &cwd(), &self.control_commands.borrow());
+            let cmd = expand_env_vars(&daemon.cmd, &lookup);
+            let approval = approve(&cmd, &path, &cwd(), &self.config.borrow().control_commands);
             let args: Vec<String> = daemon.args.iter().map(|a| expand_env_vars(a, &lookup)).collect();
             let mut options = self.process_options(env, cwd());
             options.privileged = approval.privileged;
@@ -1265,14 +1247,19 @@ impl Shell {
         self.env.borrow_mut().insert("CQ_CURRENT_COMMAND".into(), msg.to_string());
         let raw = msg.get("action").unwrap_or(&Value::Null);
         let action = parse_action(raw).map_err(|e| anyhow!("Bad action {raw}: {e}"))?;
+        let origin = Origin::from_message(msg);
+        // (A built-in action is one of BUILTIN_ACTIONS: parse_action checked.)
         if let Some(builtin) = action.get("builtin").and_then(Value::as_str) {
             return match builtin {
-                "submit" => self.command_submit(msg).await,
-                "run" => self.submit(SubmitRequest { history: false, ..SubmitRequest::from_message(msg) }).await,
+                "submit" => self.command_submit(msg, &origin).await,
+                "run" => {
+                    let request = SubmitRequest { history: false, ..SubmitRequest::from_message(msg) };
+                    self.submit(request, &origin).await
+                }
                 "previous" => Ok(self.history_step(msg, Direction::Prev)),
                 "next" => Ok(self.history_step(msg, Direction::Next)),
                 "close" => Ok(self.command_close()),
-                "requests" => Ok(self.command_requests(msg)),
+                "requests" => Ok(self.command_requests(&origin)),
                 "complete" => Ok(self.command_complete(msg)),
                 other => bail!("unknown builtin action {other:?}"),
             };
@@ -1281,34 +1268,30 @@ impl Shell {
         // submitted, but leaving the prompt and the history alone. The
         // prompt's text and selection when the action fired are in
         // $CQ_CURRENT_COMMAND (the command request, as JSON).
-        let from = SubmitRequest::from_message(msg);
-        self.submit(SubmitRequest {
+        let request = SubmitRequest {
             text: action.get("command").and_then(Value::as_str).map(str::to_owned),
             history: false,
             echo: true,
-            id: from.id,
-            zone: from.zone,
-            anchor: from.anchor,
             ..Default::default()
-        })
-        .await
+        };
+        self.submit(request, &origin).await
     }
 
-    async fn command_submit(self: &Rc<Self>, msg: &Message) -> Result<()> {
+    async fn command_submit(self: &Rc<Self>, msg: &Message, origin: &Origin) -> Result<()> {
         self.nav.borrow_mut().take();
         // The content is replaced whole: the empty text takes the frozen
         // editability and the ghost suggestion down with it (both absent).
         // The context is refreshed along with it. Not for a submission from
         // elsewhere (an `anchor`: sel, run from a cell, say): what it submits
         // isn't the prompt's text, which is left alone.
-        if anchor_field(msg).is_none() {
+        if origin.anchor.is_none() {
             let mut input = json!({ "content": { "parts": [], "selection": { "start": 0, "end": 0 } } });
             if self.prompt_look.borrow().is_some() {
                 input["context"] = self.current_context();
             }
             self.emit(prompt_configure(json!({ "input": input })));
         }
-        self.submit(SubmitRequest::from_message(msg)).await
+        self.submit(SubmitRequest::from_message(msg), origin).await
     }
 
     /// The terminal sends bare previous/next commands (the virtual chords
@@ -1417,7 +1400,7 @@ impl Shell {
     /// The heart of a submission: history, parsing and running. Reached
     /// through command_submit (the terminal's Enter binding), `cq -c`, the
     /// `run` command and key bindings, and for each parsed command.
-    async fn submit(self: &Rc<Self>, req: SubmitRequest) -> Result<()> {
+    async fn submit(self: &Rc<Self>, req: SubmitRequest, origin: &Origin) -> Result<()> {
         if let Some(text) = &req.text {
             // An empty (or whitespace-only) submission is a no-op: no
             // history entry, no echo, no process.
@@ -1434,14 +1417,17 @@ impl Shell {
             }
             // An `@zone` prefix says where it shows. Any name is a valid zone
             // — the terminal decides what to do with it.
-            let (zone, text) = match ZONE_PREFIX.captures(text) {
-                Some(m) => (Some(m[1].to_owned()), text[m[0].len()..].to_owned()),
-                None => (req.zone.clone(), text.clone()),
+            let (zoned, text) = match ZONE_PREFIX.captures(text) {
+                Some(m) => {
+                    let zoned = Origin { zone: Some(m[1].to_owned()), ..origin.clone() };
+                    (Some(zoned), text[m[0].len()..].to_owned())
+                }
+                None => (None, text.clone()),
             };
             if text.trim_start().starts_with('#') {
                 return Ok(());
             }
-            return Box::pin(self.submit_text(req, text, zone)).await;
+            return Box::pin(self.submit_text(req, text, zoned.as_ref().unwrap_or(origin))).await;
         }
 
         let Some((cmd, args)) = req.command.clone() else { bail!("nothing to run") };
@@ -1453,7 +1439,7 @@ impl Shell {
         // The terminal shows the process (a placeholder, until its output
         // comes: it takes input meanwhile) where `zone` says, decorated with
         // the command.
-        let declare = self.declare(&addr, &req);
+        let declare = self.declare(&addr, &req, origin);
         if is_builtin(&cmd) {
             self.emit(declare);
             let (message, look) = terminal_decorations(&addr, req.decoration.as_ref());
@@ -1497,16 +1483,16 @@ impl Shell {
     }
 
     /// The `configure` declaring a process's entry.
-    fn declare(&self, addr: &[String], req: &SubmitRequest) -> Message {
+    fn declare(&self, addr: &[String], req: &SubmitRequest, origin: &Origin) -> Message {
         let mut declare = json!({
             "type": "configure",
             "from": addr,
             "to": ["$term"],
-            "zone": req.zone.clone().map_or(Value::Null, Value::String),
+            "zone": origin.zone.clone().map_or(Value::Null, Value::String),
         });
         let obj = declare.as_object_mut().unwrap();
-        put_opt(obj, "anchor", req.anchor.clone());
-        if req.focus {
+        put_opt(obj, "anchor", origin.anchor.clone());
+        if origin.focus {
             obj.insert("focus".into(), json!(true));
         }
         obj.insert("background".into(), json!(req.background));
@@ -1518,16 +1504,23 @@ impl Shell {
 
     fn run_builtin(self: &Rc<Self>, name: &str, args: &[String], process_id: &str) -> Result<()> {
         for event in builtin_events(name, args)? {
-            match event {
-                // (cd reports its failure inline, in the cell this builtin
-                // runs as.)
-                BuiltinEvent::Cd { path } => self.handle_cd(&path, Some(process_id))?,
-                BuiltinEvent::Set { name, value, export } => self.handle_set(&name, &value, export),
-                BuiltinEvent::Nuke => self.kill_all(),
-                BuiltinEvent::DaemonSet { name, cmd, args, restart_ms } => self.daemon_set(&name, &cmd, args, restart_ms),
-                BuiltinEvent::DaemonEnable { name } => self.daemon_enable(&name),
-                BuiltinEvent::DaemonDisable { name } => self.daemon_disable(&name),
-            }
+            // (cd reports its failure inline, in the cell this builtin runs
+            // as.)
+            self.perform(event, Some(process_id))?;
+        }
+        Ok(())
+    }
+
+    /// Do what a builtin asks: run as a command (as process `process_id`),
+    /// or asked for by a control command's message (see BuiltinEvent).
+    fn perform(self: &Rc<Self>, event: BuiltinEvent, process_id: Option<&str>) -> Result<()> {
+        match event {
+            BuiltinEvent::Cd { path } => self.handle_cd(&path, process_id)?,
+            BuiltinEvent::Set { name, value, export } => self.handle_set(&name, &value, export),
+            BuiltinEvent::Nuke => self.kill_all(),
+            BuiltinEvent::DaemonSet { name, cmd, args, restart_ms } => self.daemon_set(&name, &cmd, args, restart_ms),
+            BuiltinEvent::DaemonEnable { name } => self.daemon_enable(&name),
+            BuiltinEvent::DaemonDisable { name } => self.daemon_disable(&name),
         }
         Ok(())
     }
@@ -1608,7 +1601,7 @@ impl Shell {
             // anew at each run. (Only the last one's messages are heeded.)
             if i == last {
                 let path = env.get("PATH").cloned().unwrap_or_default();
-                let approval = approve(&stage.cmd, &path, &run.cwd, &self.control_commands.borrow());
+                let approval = approve(&stage.cmd, &path, &run.cwd, &self.config.borrow().control_commands);
                 cmd = approval.cmd;
                 options.privileged = approval.privileged;
                 options.refusal = approval.refusal;
@@ -1721,7 +1714,7 @@ impl Shell {
     }
 
     /// Parse and run a command line.
-    async fn submit_text(self: &Rc<Self>, req: SubmitRequest, text: String, zone: Option<String>) -> Result<()> {
+    async fn submit_text(self: &Rc<Self>, req: SubmitRequest, text: String, origin: &Origin) -> Result<()> {
         // Reserve a single process id up front and share it between the
         // decoration and the first command's process (running the parsed
         // commands goes through submit again, which would otherwise generate
@@ -1742,7 +1735,7 @@ impl Shell {
         let color = req.prompt_color.clone().or_else(|| self.prompt_color.borrow().clone());
         let decoration = req.echo.then(|| {
             let mut decoration = program_look(&command_verb(&text), color.as_deref());
-            put_opt(&mut decoration, "id", req.id.clone());
+            put_opt(&mut decoration, "id", origin.id.clone());
             put_opt(&mut decoration, "color", color.clone());
             let mut submission = json!({ "content": { "parts": shell_highlight(&text, &self.path_var()) } });
             if let Some(look) = &*self.prompt_look.borrow() {
@@ -1752,21 +1745,15 @@ impl Shell {
             decoration
         });
 
-        let opts = SubmitRequest {
-            zone,
-            anchor: req.anchor.clone(),
-            history: false,
-            echo: req.echo,
-            ..Default::default()
-        };
+        let opts = SubmitRequest { history: false, echo: req.echo, ..Default::default() };
         let program = match program {
             Ok(program) => program,
             Err(err) => {
                 // Show the command anyway: an entry that only exists to carry
                 // the parse error (its placeholder shows it).
                 let addr = process_addr(&process_id);
-                let failed = SubmitRequest { decoration: decoration.clone(), focus: req.focus, ..opts };
-                let mut declare = self.declare(&addr, &failed);
+                let failed = SubmitRequest { decoration: decoration.clone(), ..opts };
+                let mut declare = self.declare(&addr, &failed, origin);
                 declare.as_object_mut().unwrap().remove("background");
                 self.emit(declare);
                 if let Some(message) = terminal_decorations(&addr, decoration.as_ref()).0 {
@@ -1778,6 +1765,8 @@ impl Shell {
         };
 
         let mut first = true;
+        // (What later commands show doesn't take the focus.)
+        let later = Origin { focus: false, ..origin.clone() };
         for item in program.complete_commands.iter().flat_map(|c| &c.0) {
             // Only the first command carries the decoration and the reserved
             // id; later `;`-separated commands generate their own.
@@ -1785,14 +1774,14 @@ impl Shell {
                 decoration: if first { decoration.clone() } else { None },
                 process_id: first.then(|| process_id.clone()),
                 background: matches!(item.1, ast::SeparatorOperator::Async),
-                focus: first && req.focus,
                 ..opts.clone()
             };
+            let origin = if first { origin } else { &later };
             first = false;
             let pipeline = single_pipeline(&item.0, "")?;
             match pipeline.seq.as_slice() {
-                [command] => self.run_command(simple(command)?, opts).await?,
-                commands => self.run_pipeline(commands, opts).await?,
+                [command] => self.run_command(simple(command)?, opts, origin).await?,
+                commands => self.run_pipeline(commands, opts, origin).await?,
             }
         }
         Ok(())
@@ -1844,18 +1833,21 @@ impl Shell {
         Ok((name.clone(), value))
     }
 
-    async fn run_command(self: &Rc<Self>, command: &ast::SimpleCommand, opts: SubmitRequest) -> Result<()> {
+    async fn run_command(
+        self: &Rc<Self>,
+        command: &ast::SimpleCommand,
+        opts: SubmitRequest,
+        origin: &Origin,
+    ) -> Result<()> {
         let expanded = self.expand_simple(command).await?;
         if command.word_or_name.is_none() && expanded.words.is_empty() {
             // Assignments alone: shell variables.
             for (name, value) in expanded.env {
                 let set = SubmitRequest {
                     command: Some(("set".into(), vec![format!("{name}={value}")])),
-                    zone: opts.zone.clone(),
-                    anchor: opts.anchor.clone(),
                     ..Default::default()
                 };
-                Box::pin(self.submit(set)).await?;
+                Box::pin(self.submit(set, origin)).await?;
             }
             return Ok(());
         }
@@ -1868,10 +1860,15 @@ impl Shell {
             env: expanded.env,
             ..opts
         };
-        Box::pin(self.submit(req)).await
+        Box::pin(self.submit(req, origin)).await
     }
 
-    async fn run_pipeline(self: &Rc<Self>, commands: &[ast::Command], opts: SubmitRequest) -> Result<()> {
+    async fn run_pipeline(
+        self: &Rc<Self>,
+        commands: &[ast::Command],
+        opts: SubmitRequest,
+        origin: &Origin,
+    ) -> Result<()> {
         // The stages' words expand before any of them starts, as bash expands
         // a whole pipeline up front.
         let mut stages = vec![];
@@ -1893,7 +1890,7 @@ impl Shell {
         self.remember(&process_id, run.clone());
 
         let addr = process_addr(&process_id);
-        self.emit(self.declare(&addr, &opts));
+        self.emit(self.declare(&addr, &opts, origin));
         let (message, look) = terminal_decorations(&addr, opts.decoration.as_ref());
         if let Some(message) = message {
             self.emit(message);

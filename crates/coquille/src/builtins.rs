@@ -1,6 +1,8 @@
 //! The builtins: commands the shell runs itself. Each says what it asks the
-//! shell to do (see Shell::run_builtin); control commands ask the same with
-//! messages to ["$shell"] (see Shell::handle).
+//! shell to do (a BuiltinEvent: see Shell::perform); control commands ask the
+//! same with messages to ["$shell"] (see BuiltinEvent::from_message).
+
+use serde_json::Value;
 
 pub const BUILTIN_NAMES: &[&str] = &["cd", "set", "export", "nuke", "daemon"];
 
@@ -17,6 +19,47 @@ pub enum BuiltinEvent {
     DaemonSet { name: String, cmd: String, args: Vec<String>, restart_ms: Option<u64> },
     DaemonEnable { name: String },
     DaemonDisable { name: String },
+}
+
+impl BuiltinEvent {
+    /// What a control command's message to ["$shell"] asks for, if it is
+    /// one of the builtin requests: `cd` {path}, `set` {name, value,
+    /// export?}, `nuke`, `daemon_set` {name, cmd, args?, restartMs?},
+    /// `daemon_enable` {name}, `daemon_disable` {name}. (A missing text
+    /// field is empty; one that isn't a text is taken as its JSON.)
+    pub fn from_message(msg: &Value) -> Option<BuiltinEvent> {
+        let text = |value: &Value| value.as_str().map_or_else(|| value.to_string(), str::to_owned);
+        let field = |name: &str| match msg.get(name) {
+            Some(Value::Null) | None => String::new(),
+            Some(value) => text(value),
+        };
+        Some(match msg.get("type").and_then(Value::as_str)? {
+            "cd" => BuiltinEvent::Cd { path: field("path") },
+            "set" => BuiltinEvent::Set {
+                name: field("name"),
+                value: field("value"),
+                export: msg.get("export") == Some(&Value::Bool(true)),
+            },
+            "nuke" => BuiltinEvent::Nuke,
+            "daemon_set" => BuiltinEvent::DaemonSet {
+                name: field("name"),
+                cmd: field("cmd"),
+                args: msg.get("args").and_then(Value::as_array).map_or(vec![], |a| a.iter().map(text).collect()),
+                restart_ms: msg.get("restartMs").and_then(Value::as_u64),
+            },
+            "daemon_enable" => BuiltinEvent::DaemonEnable { name: field("name") },
+            "daemon_disable" => BuiltinEvent::DaemonDisable { name: field("name") },
+            _ => return None,
+        })
+    }
+
+    /// Whether, asked for by a message, it holds the shell's input up until
+    /// it is done (see Shell::receive), rather than run as a task alongside
+    /// what comes next. (Kept as it was when these requests were dispatched
+    /// by name: cd and set run as tasks.)
+    pub fn holds_input(&self) -> bool {
+        !matches!(self, BuiltinEvent::Cd { .. } | BuiltinEvent::Set { .. })
+    }
 }
 
 fn assignments(args: &[String], export: bool) -> Vec<BuiltinEvent> {
@@ -82,5 +125,20 @@ mod tests {
             vec![BuiltinEvent::DaemonSet { name: "v".into(), cmd: "watch".into(), args: s(&["-x"]), restart_ms: Some(500) }]
         );
         assert!(builtin_events("daemon", &s(&["set", "v"])).is_err());
+    }
+
+    #[test]
+    fn parses_messages() {
+        use serde_json::json;
+        assert_eq!(
+            BuiltinEvent::from_message(&json!({"type": "set", "name": "A", "value": 3, "export": true})),
+            Some(BuiltinEvent::Set { name: "A".into(), value: "3".into(), export: true })
+        );
+        let daemon = json!({"type": "daemon_set", "name": "v", "cmd": "w", "args": ["-x", 1], "restartMs": 5});
+        let expected =
+            BuiltinEvent::DaemonSet { name: "v".into(), cmd: "w".into(), args: s(&["-x", "1"]), restart_ms: Some(5) };
+        assert_eq!(BuiltinEvent::from_message(&daemon), Some(expected));
+        assert_eq!(BuiltinEvent::from_message(&json!({"type": "cd"})), Some(BuiltinEvent::Cd { path: "".into() }));
+        assert_eq!(BuiltinEvent::from_message(&json!({"type": "parse"})), None);
     }
 }

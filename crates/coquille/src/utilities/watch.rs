@@ -21,10 +21,9 @@
 //! Its cells are reset just before it starts again: until then, they show
 //! how its last run ended.
 //!
-//! The command shares our fds 3, 4 and 5 (buche's channels): to buche, it
-//! speaks as us.
+//! The command shares our fds 3, 4 and our control channel (buche's
+//! channels): to buche, it speaks as us.
 
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -32,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use coquille::channel::{control_fd, write_line};
 use notify::{EventKind, RecursiveMode, Watcher};
+use serde_json::json;
 
 #[derive(Parser)]
 #[command(name = "watch", about = "Run a command, and run it again whenever the files it uses change")]
@@ -76,9 +77,6 @@ fn seconds(text: &str) -> Result<Duration, String> {
     Duration::try_from_secs_f64(n).map_err(|_| format!("{text:?} is not a number of seconds, 0 or more"))
 }
 
-/// buche's control channel, which the command speaks on too.
-const CONTROL_FD: RawFd = 5;
-
 /// How often to check whether the command is still running.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -86,8 +84,9 @@ const POLL: Duration = Duration::from_millis(50);
 /// output went to (whichever exist; buche creates none). Not under buche (no
 /// control channel), there is nothing to reset.
 fn reset() {
-    let message = b"{\"type\": \"reset\", \"from\": [\"$proc\"], \"to\": [\"$term\"]}\n";
-    unsafe { libc::write(CONTROL_FD, message.as_ptr().cast(), message.len()) };
+    if let Some(fd) = control_fd() {
+        write_line(fd, &json!({ "type": "reset", "from": ["$proc"], "to": ["$term"] }).to_string());
+    }
 }
 
 fn run(prog: &[String]) -> Result<Child> {

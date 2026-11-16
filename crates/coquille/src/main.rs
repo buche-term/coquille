@@ -2,33 +2,15 @@
 //! protocol (JSON lines) on its control channel (fd $BUCHE_CONTROL_FD), or on
 //! stdin/stdout.
 
-mod approval;
-mod builtins;
-mod config;
-mod config_watch;
-mod expand;
-mod fdio;
-mod highlight;
-mod history;
-mod library;
-mod look;
-mod message;
-mod process;
-mod prompt;
-mod requests;
-mod shell;
-mod trust;
-mod util;
-
 use std::path::PathBuf;
 
 use clap::Parser;
+use coquille::Shell;
+use coquille::channel::{control_fd_var, json_lines};
+use coquille::fdio::{FdStream, dup_cloexec};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-
-use crate::fdio::{FdStream, dup_cloexec};
-use crate::shell::Shell;
 
 #[derive(Parser)]
 #[command(name = "cq", version, about = "A shell for the Buche terminal")]
@@ -59,25 +41,11 @@ fn terminal_size() -> (u16, u16) {
 /// Read JSON lines from `input` into `tx` (lines that aren't JSON are
 /// skipped).
 async fn read_messages(input: impl AsyncRead + Unpin, tx: mpsc::UnboundedSender<Value>) {
-    let mut reader = BufReader::new(input);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {
-                if let Ok(message) = serde_json::from_slice::<Value>(&line)
-                    && tx.send(message).is_err()
-                {
-                    return;
-                }
-            }
-        }
-    }
+    json_lines(input, |message| std::future::ready(tx.send(message).is_ok())).await
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let control_fd: Option<i32> = std::env::var("BUCHE_CONTROL_FD").ok().and_then(|fd| fd.parse().ok());
+    let control_fd = control_fd_var();
 
     // The control fd is used for output (unless --stdout is given) and for
     // input (unless --play or -c is given).

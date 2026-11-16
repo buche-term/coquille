@@ -1,4 +1,4 @@
-//! Small helpers: paths, hashes, JSON objects, UTF-16 offsets.
+//! Small helpers: paths, hashes, JSON objects, addresses, UTF-16 offsets.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -56,6 +56,20 @@ pub fn expand_home(word: &str) -> String {
     }
 }
 
+/// `~` and `~user` at the start of a path expanded to the home directory
+/// (the user's), as Python's `os.path.expanduser` does it: an unknown user
+/// is left as is.
+pub fn expand_user(path: &str) -> String {
+    let Some(rest) = path.strip_prefix('~') else { return path.to_owned() };
+    let (user, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let home = if user.is_empty() { Some(home()) } else { user_home(user) };
+    match home.map(|h| h.to_string_lossy().into_owned()) {
+        Some(home) if tail.is_empty() => home,
+        Some(home) => format!("{}{tail}", home.trim_end_matches('/')),
+        None => path.to_owned(),
+    }
+}
+
 /// A path with the home directory as `~`.
 pub fn tildify(file: &str) -> String {
     let home = home();
@@ -78,6 +92,13 @@ pub fn is_executable(path: &Path) -> bool {
         }
         _ => false,
     }
+}
+
+/// The directories of a PATH, in order, as a POSIX shell (and execvp)
+/// searches them: relative to the working directory `cwd`, an empty entry
+/// being the working directory itself.
+pub fn path_dirs<'a>(path: &'a str, cwd: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
+    path.split(':').map(move |dir| resolve(cwd, if dir.is_empty() { "." } else { dir }))
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -146,6 +167,26 @@ pub fn address_of(value: Option<&Value>) -> Option<Vec<String>> {
         .collect()
 }
 
+/// A relative address (["$proc", ...rest]: a process's, as it says it)
+/// qualified under `prefix` (where it is: [...prefix, ...rest]). None if it
+/// isn't relative.
+pub fn qualify(address: &[String], prefix: &[String]) -> Option<Vec<String>> {
+    let rest = address.strip_prefix(&["$proc".to_owned()])?;
+    Some(prefix.iter().chain(rest).cloned().collect())
+}
+
+/// The address `rest` under a process, relative to it (["$proc", ...rest]:
+/// as the process knows it).
+pub fn relative(rest: &[String]) -> Vec<String> {
+    std::iter::once("$proc".to_owned()).chain(rest.iter().cloned()).collect()
+}
+
+/// An address under `prefix` (a process's), relative to it (see relative).
+/// None if it isn't under it.
+pub fn unqualify(address: &[String], prefix: &[String]) -> Option<Vec<String>> {
+    Some(relative(address.strip_prefix(prefix)?))
+}
+
 /// Incremental UTF-8 decoding of a byte stream: a character split between
 /// two reads is decoded whole, with the second.
 #[derive(Default)]
@@ -184,6 +225,30 @@ mod tests {
         assert_eq!(resolve(Path::new("/a/b"), "../c/./d"), PathBuf::from("/a/c/d"));
         assert_eq!(resolve(Path::new("/a"), "/x/../y"), PathBuf::from("/y"));
         assert_eq!(resolve(Path::new("/"), ".."), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn expands_users() {
+        let home = home().to_string_lossy().into_owned();
+        assert_eq!(expand_user("~"), home);
+        assert_eq!(expand_user("~/x"), format!("{}/x", home.trim_end_matches('/')));
+        assert_eq!(expand_user("~nosuchuserxyz/x"), "~nosuchuserxyz/x");
+        assert_eq!(expand_user("a/~"), "a/~");
+    }
+
+    #[test]
+    fn path_dirs_like_posix() {
+        let dirs: Vec<PathBuf> = path_dirs("/bin::sub", Path::new("/w")).collect();
+        assert_eq!(dirs, vec![PathBuf::from("/bin"), PathBuf::from("/w"), PathBuf::from("/w/sub")]);
+    }
+
+    #[test]
+    fn qualifies_addresses() {
+        let a = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(qualify(&a(&["$proc", "x"]), &a(&["$proc", "cq", "3"])), Some(a(&["$proc", "cq", "3", "x"])));
+        assert_eq!(qualify(&a(&["$term"]), &a(&["$proc", "cq", "3"])), None);
+        assert_eq!(unqualify(&a(&["$proc", "cq", "3", "x"]), &a(&["$proc", "cq", "3"])), Some(a(&["$proc", "x"])));
+        assert_eq!(unqualify(&a(&["$proc", "cq", "4"]), &a(&["$proc", "cq", "3"])), None);
     }
 
     #[test]

@@ -23,6 +23,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
+use coquille::channel::{control_fd, write_line};
+use coquille::util::{address_of, expand_user, qualify, unqualify, utf16_len, utf16_to_byte};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -146,39 +148,6 @@ fn quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\"'\"'"))
 }
 
-/// `~` and `~user` at the start of a path, expanded (as Python's
-/// `os.path.expanduser`: an unknown user is left as is).
-fn expand_user(path: &str) -> String {
-    let Some(rest) = path.strip_prefix('~') else { return path.to_owned() };
-    let (user, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-    let home = if user.is_empty() {
-        std::env::var("HOME").ok().or_else(|| home_of(None))
-    } else {
-        home_of(Some(user))
-    };
-    match home {
-        Some(home) if tail.is_empty() => home,
-        Some(home) => format!("{}{tail}", home.trim_end_matches('/')),
-        None => path.to_owned(),
-    }
-}
-
-/// A user's home directory (None: the current user's), from the password
-/// database.
-fn home_of(user: Option<&str>) -> Option<String> {
-    let pw = unsafe {
-        match user {
-            None => libc::getpwuid(libc::getuid()),
-            Some(user) => libc::getpwnam(std::ffi::CString::new(user).ok()?.as_ptr()),
-        }
-    };
-    if pw.is_null() {
-        return None;
-    }
-    let dir = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
-    Some(dir.to_string_lossy().into_owned())
-}
-
 /// A path's directory and last component, as Python's `os.path.split`.
 fn split_path(path: &str) -> (String, String) {
     let i = path.rfind('/').map_or(0, |i| i + 1);
@@ -247,50 +216,6 @@ fn split_lines(text: &str) -> Vec<String> {
     lines
 }
 
-/// The character index at UTF-16 offset `n` of `text` (clamped to it).
-fn char_index(text: &[char], n: usize) -> usize {
-    let mut units = 0;
-    for (i, c) in text.iter().enumerate() {
-        if units >= n {
-            return i;
-        }
-        units += c.len_utf16();
-    }
-    text.len()
-}
-
-fn utf16_len(text: &[char]) -> usize {
-    text.iter().map(|c| c.len_utf16()).sum()
-}
-
-/// The control channel, if there is one (buche's, through the shell).
-fn control_fd() -> Option<RawFd> {
-    let fd: RawFd = std::env::var("BUCHE_CONTROL_FD").ok()?.parse().ok()?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(fd)
-}
-
-/// Write one line on a file descriptor (which may be non-blocking).
-fn write_line(fd: RawFd, line: &str) {
-    let mut data = line.trim_end_matches('\n').as_bytes().to_vec();
-    data.push(b'\n');
-    let mut written = 0;
-    while written < data.len() {
-        let n = unsafe { libc::write(fd, data[written..].as_ptr().cast(), data.len() - written) };
-        if n >= 0 {
-            written += n as usize;
-            continue;
-        }
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::EAGAIN) | Some(libc::EINTR) => {
-                let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-                unsafe { libc::poll(&mut pfd, 1, -1) };
-            }
-            _ => return,
-        }
-    }
-}
-
 fn send(fd: RawFd, message: &Value) {
     write_line(fd, &message.to_string());
 }
@@ -319,12 +244,8 @@ impl Relay {
             if to_shell {
                 continue;
             }
-            if let Some(Value::Array(from)) = obj.get("from")
-                && from.first().and_then(Value::as_str) == Some("$proc")
-            {
-                let mut qualified: Vec<Value> = self.prefix.iter().map(|s| json!(s)).collect();
-                qualified.extend(from[1..].iter().cloned());
-                obj.insert("from".into(), Value::Array(qualified));
+            if let Some(from) = address_of(obj.get("from")).and_then(|from| qualify(&from, &self.prefix)) {
+                obj.insert("from".into(), json!(from));
             }
             let _guard = self.lock.lock();
             write_line(self.control_fd, &Value::Object(obj).to_string());
@@ -343,13 +264,9 @@ impl Relay {
             let Ok(line) = line else { return };
             let mut out = line.clone();
             if let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&line)
-                && let Some(Value::Array(to)) = obj.get("to")
-                && to.len() >= self.prefix.len()
-                && to.iter().zip(&self.prefix).all(|(a, b)| a.as_str() == Some(b))
+                && let Some(to) = address_of(obj.get("to")).and_then(|to| unqualify(&to, &self.prefix))
             {
-                let mut local = vec![json!("$proc")];
-                local.extend(to[self.prefix.len()..].iter().cloned());
-                obj.insert("to".into(), Value::Array(local));
+                obj.insert("to".into(), json!(to));
                 out = Value::Object(obj).to_string().into_bytes();
             }
             out.push(b'\n');
@@ -434,7 +351,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             // command we submitted ourselves) carries no selection: the
             // cursor is at the end of the text.
             let at = |name| current.pointer(&format!("/selection/{name}")).and_then(Value::as_u64).map(|n| n as usize);
-            let start = start.or_else(|| at("start")).unwrap_or(text.encode_utf16().count());
+            let start = start.or_else(|| at("start")).unwrap_or(utf16_len(&text));
             let end = end.or_else(|| at("end")).unwrap_or(start);
             (text, start, end)
         }
@@ -452,8 +369,10 @@ fn run(cli: Cli) -> Result<i32, String> {
     if cli.command.is_empty() {
         return Err("no command given".into());
     }
+    // (In characters, from here on.)
+    let char_index = |n| text[..utf16_to_byte(&text, n)].chars().count();
+    let (mut start, mut end) = (char_index(start), char_index(end));
     let chars: Vec<char> = text.chars().collect();
-    let (mut start, mut end) = (char_index(&chars, start), char_index(&chars, end));
     end = end.max(start);
     if cli.replace {
         (start, end) = (0, chars.len());
@@ -482,8 +401,9 @@ fn run(cli: Cli) -> Result<i32, String> {
 
     // The prompt as it would stand with the output in place of the range,
     // and the cursor after it.
-    let new_text: String = chars[..start].iter().copied().chain(insert.chars()).chain(chars[end..].iter().copied()).collect();
-    let new_pos = utf16_len(&chars[..start]) + insert.encode_utf16().count();
+    let before: String = chars[..start].iter().collect();
+    let new_text = before.clone() + &insert + &chars[end..].iter().collect::<String>();
+    let new_pos = utf16_len(&before) + utf16_len(&insert);
 
     let Some(fd) = control else {
         if !insert.is_empty() {
@@ -611,12 +531,5 @@ mod tests {
         assert_eq!(split_lines("a\nb\r\nc\rd\n"), vec!["a", "b", "c", "d"]);
         assert_eq!(split_lines(""), Vec::<String>::new());
         assert_eq!(split_lines("\n"), vec![""]);
-    }
-
-    #[test]
-    fn utf16_positions() {
-        let text = chars("😀 x");
-        assert_eq!(char_index(&text, 3), 2);
-        assert_eq!(utf16_len(&text[..2]), 3);
     }
 }

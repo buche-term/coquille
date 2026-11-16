@@ -21,16 +21,17 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, spawn_local};
 
 use crate::approval::OPEN_TO_ALL;
+use crate::channel::json_lines;
 use crate::fdio::{FdStream, Writer, dup_cloexec, pipe, set_cloexec, spawn_writer};
 use crate::history::history_file;
 use crate::library::{LIB_SALT_ENV, LibraryFiles, forward_library, new_salt, verify_library};
 use crate::message::{Message, kind, make_error};
-use crate::util::{Utf8Decoder, merged, resolve};
+use crate::util::{Utf8Decoder, address_of, merged, qualify, resolve};
 
 /// A redirection of one of the child's fds (0 to 5).
 #[derive(Clone, Debug)]
@@ -255,20 +256,18 @@ impl Control {
         // process's address (["cq", id]) is spliced in right after it, so a
         // child `from` of ["$proc", ...rest] becomes ["$proc", "cq", id,
         // ...rest] within this shell's sub-tree.
-        let child_from = crate::util::address_of(message.get("from"));
-        let Some(child_from) = child_from.filter(|f| f.first().is_some_and(|h| h == "$proc")) else {
+        let prefix = ["$proc".to_owned(), "cq".to_owned(), id.clone()];
+        let Some(from) = address_of(message.get("from")).and_then(|f| qualify(&f, &prefix)) else {
             let from = message.get("from").cloned().unwrap_or(Value::Null);
             return self.error(format!("Process {id}: message 'from' must start with \"$proc\" (got {from})"));
         };
         let Some(obj) = message.as_object_mut() else { return };
-        let mut from = vec!["$proc".to_owned(), "cq".to_owned(), id.clone()];
-        from.extend_from_slice(&child_from[1..]);
         obj.insert("from".into(), json!(from));
 
         if kind(&message) == "configure"
             && let Some(delegate) = message.as_object_mut().and_then(|o| o.remove("delegate"))
         {
-            let key = address_key(&child_from[1..]);
+            let key = address_key(&from[prefix.len()..]);
             let types: Option<Vec<String>> = delegate.as_array().and_then(|a| {
                 a.iter().map(|t| t.as_str().map(str::to_owned)).collect()
             });
@@ -526,7 +525,7 @@ impl Process {
         let data_shared = shared.clone();
         let data_task = spawn_local(json_lines(FdStream::new(dataout_p)?, move |data| {
             data_shared.send_to("$frame", "frame", json!({ "type": "data", "data": data }));
-            async {}
+            async { true }
         }));
 
         // fd 5: the control channel. Its messages are handled in order: a
@@ -544,7 +543,10 @@ impl Process {
         });
         let control_task = spawn_local(json_lines(FdStream::new(control_p)?, move |message| {
             let control = control.clone();
-            async move { control.on_control(message).await }
+            async move {
+                control.on_control(message).await;
+                true
+            }
         }));
 
         spawn_local(async move {
@@ -711,26 +713,4 @@ async fn read_stdout_pipe(mut stream: FdStream, shared: Rc<Shared>, mut stop: on
         }
     }
     shared.emit_stdout(decoder.finish());
-}
-
-/// Hand each JSON line of `stream` to `handle`, in order, until its end
-/// (lines that aren't JSON are skipped).
-async fn json_lines<F, Fut>(stream: FdStream, handle: F)
-where
-    F: Fn(Value) -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    let mut reader = BufReader::new(stream);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {
-                if let Ok(value) = serde_json::from_slice::<Value>(&line) {
-                    handle(value).await;
-                }
-            }
-        }
-    }
 }
