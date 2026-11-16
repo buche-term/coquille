@@ -67,6 +67,11 @@ bindings:
   #   null                         unbind the key
   # Add `freeze: true|false` to an object form to set whether it freezes the
   # prompt while it is handled (by default, only submit and close do).
+  # Add `title` (short) and `description` (a sentence) to say what it does,
+  # and `categories` (a list of names) to file it: buche shows them in its
+  # help (Alt+q ?), where every binding of cq's is also in the category cq.
+  # E.g.
+  #   ctrl+t: {command: "...", title: "Pick a file", categories: [files]}
   # `Previous` and `Next` are bare ArrowUp on the first line and ArrowDown on
   # the last line of the prompt.
   # Any chord can be bound, Alt ones included, except Alt+q (buche's

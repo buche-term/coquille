@@ -287,13 +287,29 @@ fn parse_env_entry(raw: &Value) -> Result<EnvEntry, String> {
     })
 }
 
+/// The category every binding of the configuration is in (first), for the
+/// terminal's help to file them under: e.g. a toggle for all of them.
+const OWN_CATEGORY: &str = "cq";
+
+/// Put a (validated) binding in OWN_CATEGORY, first, along with its own.
+fn with_own_category(binding: &mut Value) {
+    let Some(obj) = binding.as_object_mut() else { return };
+    let mut categories = vec![json!(OWN_CATEGORY)];
+    if let Some(Value::Array(own)) = obj.get("categories") {
+        categories.extend(own.iter().filter(|c| c.as_str() != Some(OWN_CATEGORY)).cloned());
+    }
+    obj.insert("categories".into(), Value::Array(categories));
+}
+
 /// Parse an action (a key binding's, from the config or the terminal, or a
 /// clicked part's, from the terminal):
 ///   "command line"                         run it
 ///   { command: "command line", freeze? }   the same
 ///   { builtin: name, freeze? }             a built-in action (BUILTIN_ACTIONS)
-/// and `inherit` (also in the cells under the prompt: see buche's). Returns
-/// it validated, as the terminal takes it (a built-in's `freeze` made
+/// and `inherit` (also in the cells under the prompt: see buche's), `title`,
+/// `description` and `categories` (what the terminal shows for it, and how it
+/// files it, e.g. in its help).
+/// Returns it validated, as the terminal takes it (a built-in's `freeze` made
 /// explicit), or what is wrong with it.
 pub fn parse_action(raw: &Value) -> Result<Value, String> {
     if let Some(command) = raw.as_str() {
@@ -305,7 +321,8 @@ pub fn parse_action(raw: &Value) -> Result<Value, String> {
     if obj.contains_key("builtin") == obj.contains_key("command") {
         return Err(expected());
     }
-    if let Some(extra) = obj.keys().find(|k| !["builtin", "command", "freeze", "inherit"].contains(&k.as_str())) {
+    const FIELDS: &[&str] = &["builtin", "command", "freeze", "inherit", "title", "description", "categories"];
+    if let Some(extra) = obj.keys().find(|k| !FIELDS.contains(&k.as_str())) {
         return Err(format!("unknown field {extra:?}"));
     }
     let flag = |name: &str| match obj.get(name) {
@@ -333,6 +350,29 @@ pub fn parse_action(raw: &Value) -> Result<Value, String> {
     }
     if inherit {
         action.insert("inherit".into(), json!(true));
+    }
+    for name in ["title", "description"] {
+        match obj.get(name) {
+            None => {}
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                action.insert(name.into(), json!(text));
+            }
+            Some(_) => return Err(format!("`{name}` must be a text")),
+        }
+    }
+    if let Some(raw) = obj.get("categories") {
+        let mut categories: Vec<&str> = vec![];
+        for c in raw.as_array().ok_or("`categories` must be a list of names")? {
+            match c.as_str().map(str::trim) {
+                Some(name) if !name.is_empty() => {
+                    if !categories.contains(&name) {
+                        categories.push(name);
+                    }
+                }
+                _ => return Err("`categories` must be a list of names".into()),
+            }
+        }
+        action.insert("categories".into(), json!(categories));
     }
     Ok(Value::Object(action))
 }
@@ -784,7 +824,8 @@ fn apply_entry(config: &mut ResolvedConfig, entry: &ConfigEntry, problems: &mut 
             continue;
         }
         match parse_action(&raw) {
-            Ok(binding) => {
+            Ok(mut binding) => {
+                with_own_category(&mut binding);
                 config.bindings.insert(key, binding);
             }
             Err(e) => problems.add(Some(file), format!("bindings.{key}: {e}; ignored")),
@@ -837,8 +878,9 @@ mod tests {
         let env = HashMap::from([("XDG_CONFIG_HOME".to_owned(), dir.to_string_lossy().into_owned())]);
         let config = load_config(&dir, &env);
         assert!(config.errors.is_empty(), "{:?}", config.errors);
-        assert_eq!(config.bindings["Enter"], json!({"builtin": "submit", "freeze": true}));
-        assert_eq!(config.bindings["Tab"], json!({"builtin": "complete", "freeze": false}));
+        let enter = json!({"builtin": "submit", "freeze": true, "categories": ["cq"]});
+        assert_eq!(config.bindings["Enter"], enter);
+        assert_eq!(config.bindings["Tab"], json!({"builtin": "complete", "freeze": false, "categories": ["cq"]}));
         assert_eq!(config.history_size, 10000);
         assert_eq!(config.prompt.vars, vec![("COLOR".to_owned(), "${HOSTNAME|hue}".to_owned())]);
         assert_eq!(config.prompt.parts.len(), 4);
@@ -855,6 +897,34 @@ mod tests {
         assert!(parse_action(&json!({"builtin": "nope"})).is_err());
         assert!(parse_action(&json!({"command": "x", "builtin": "submit"})).is_err());
         assert!(parse_action(&json!("  ")).is_err());
+        // What the terminal shows for it.
+        assert_eq!(
+            parse_action(&json!({"command": "x", "title": "Pick a file", "description": "Pick files with fzf"})),
+            Ok(json!({"command": "x", "title": "Pick a file", "description": "Pick files with fzf"}))
+        );
+        assert_eq!(
+            parse_action(&json!({"builtin": "submit", "title": "Run"})),
+            Ok(json!({"builtin": "submit", "freeze": true, "title": "Run"}))
+        );
+        assert!(parse_action(&json!({"command": "x", "title": 3})).is_err());
+        assert!(parse_action(&json!({"command": "x", "title": " "})).is_err());
+        // How the terminal files it.
+        assert_eq!(
+            parse_action(&json!({"command": "x", "categories": ["files", " fzf ", "files"]})),
+            Ok(json!({"command": "x", "categories": ["files", "fzf"]}))
+        );
+        assert!(parse_action(&json!({"command": "x", "categories": "files"})).is_err());
+        assert!(parse_action(&json!({"command": "x", "categories": [""]})).is_err());
+    }
+
+    #[test]
+    fn bindings_in_own_category() {
+        let mut b = parse_action(&json!({"command": "x", "categories": ["files", "cq"]})).unwrap();
+        with_own_category(&mut b);
+        assert_eq!(b["categories"], json!(["cq", "files"]));
+        let mut b = parse_action(&json!("ls")).unwrap();
+        with_own_category(&mut b);
+        assert_eq!(b["categories"], json!(["cq"]));
     }
 
     #[test]
