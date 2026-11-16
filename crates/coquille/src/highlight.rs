@@ -8,7 +8,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::builtins::{BUILTIN_NAMES, is_builtin};
-use crate::util::{cwd, expand_home, home, is_executable, path_dirs, resolve};
+use crate::util::{cwd, expand_home, find_executable, home, is_executable, path_dirs, resolve};
+use crate::words::{quote, unquote_partial, word_before};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
@@ -65,8 +66,7 @@ static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .unwrap()
 });
-static VAR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*").unwrap());
+static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*").unwrap());
 
 const OPERATORS: &[&str] = &["&&", "||", "|", ";", "&"];
 const REDIRECTS: &[&str] = &[">", "<", ">>", "2>"];
@@ -76,10 +76,7 @@ fn cmd_exists(cmd: &str, path: &str) -> bool {
     if is_builtin(cmd) {
         return true;
     }
-    if cmd.contains('/') {
-        return is_executable(&resolve(&cwd(), cmd));
-    }
-    path_dirs(path, &cwd()).any(|dir| is_executable(&dir.join(cmd)))
+    find_executable(cmd, path, &cwd()).is_some_and(|exe| is_executable(&exe))
 }
 
 fn fs_path_exists(arg: &str) -> bool {
@@ -217,11 +214,12 @@ pub fn shell_highlight(text: &str, path: &str) -> Vec<Value> {
         .collect();
     let mut previous: Option<char> = None;
     for (i, c) in text.char_indices() {
-        if c == '#'
-            && previous.is_none_or(char::is_whitespace)
-            && !quoted.iter().any(|&(s, e)| i >= s && i < e)
-        {
-            ranges.push(Range { start: i, end: text.len(), cls: Class::Comment });
+        if c == '#' && previous.is_none_or(char::is_whitespace) && !quoted.iter().any(|&(s, e)| i >= s && i < e) {
+            ranges.push(Range {
+                start: i,
+                end: text.len(),
+                cls: Class::Comment,
+            });
             break;
         }
         previous = Some(c);
@@ -230,25 +228,36 @@ pub fn shell_highlight(text: &str, path: &str) -> Vec<Value> {
     to_parts(text, ranges)
 }
 
-/// The word being completed: the non-space run just left of byte `position`,
-/// and where it starts.
-pub fn word_before(text: &str, position: usize) -> (usize, &str) {
-    let left = &text[..position];
-    let start = left.rfind(char::is_whitespace).map_or(0, |i| i + left[i..].chars().next().unwrap().len_utf8());
-    (start, &left[start..])
-}
-
 /// Completions for the word left of byte `position` in `text`: builtins
 /// and executables (in `path`) in command position, else files (directories
 /// first, marked with a `/`).
 pub fn shell_complete(text: &str, position: usize, path: &str) -> Vec<String> {
-    let (start, prefix) = word_before(text, position);
+    let (start, word) = word_before(text, position);
     let before = text[..start].trim_end();
     let command_position = before.is_empty() || before.ends_with(['|', '&', ';']);
+    // A word with quotes or backslashes is completed as the shell reads it,
+    // and the completions quoted.
+    if word.contains(['\'', '"', '\\']) {
+        let Some(prefix) = unquote_partial(word) else {
+            return vec![];
+        };
+        return complete(&prefix, command_position, path, false)
+            .iter()
+            .map(|c| quote(c))
+            .collect();
+    }
+    complete(word, command_position, path, true)
+}
 
+/// Completions for `prefix` (unquoted): see shell_complete. `~` is the home
+/// directory if `tilde`.
+fn complete(prefix: &str, command_position: bool, path: &str, tilde: bool) -> Vec<String> {
     if command_position {
-        let mut builtins: Vec<String> =
-            BUILTIN_NAMES.iter().filter(|b| b.starts_with(prefix)).map(|b| b.to_string()).collect();
+        let mut builtins: Vec<String> = BUILTIN_NAMES
+            .iter()
+            .filter(|b| b.starts_with(prefix))
+            .map(|b| b.to_string())
+            .collect();
         builtins.sort();
         let mut executables = std::collections::BTreeSet::new();
         for dir in path_dirs(path, &cwd()) {
@@ -266,14 +275,16 @@ pub fn shell_complete(text: &str, position: usize, path: &str) -> Vec<String> {
 
     let home = home().to_string_lossy().into_owned();
     // (Shown again as typed: see below.)
-    let tilde = prefix == "~" || prefix.starts_with("~/");
-    let expanded = expand_home(prefix);
+    let tilde = tilde && (prefix == "~" || prefix.starts_with("~/"));
+    let expanded = if tilde { expand_home(prefix) } else { prefix.to_owned() };
     let pattern = format!("{}*", glob::Pattern::escape(&expanded));
     let options = glob::MatchOptions {
         require_literal_leading_dot: !prefix.rsplit('/').next().unwrap_or("").starts_with('.'),
         ..Default::default()
     };
-    let Ok(paths) = glob::glob_with(&pattern, options) else { return vec![] };
+    let Ok(paths) = glob::glob_with(&pattern, options) else {
+        return vec![];
+    };
     let mut results: Vec<(bool, String)> = paths
         .flatten()
         .map(|p| {
@@ -298,7 +309,9 @@ pub fn shell_complete(text: &str, position: usize, path: &str) -> Vec<String> {
 
 /// The longest common prefix of `values`.
 pub fn common_prefix(values: &[String]) -> String {
-    let Some(first) = values.first() else { return String::new() };
+    let Some(first) = values.first() else {
+        return String::new();
+    };
     let mut len = first.len();
     for value in &values[1..] {
         len = first
@@ -319,7 +332,12 @@ mod tests {
     fn styles(text: &str) -> Vec<(String, Option<String>)> {
         shell_highlight(text, "/bin:/usr/bin")
             .into_iter()
-            .map(|p| (p["text"].as_str().unwrap().to_owned(), p.get("style").and_then(|s| s.as_str()).map(str::to_owned)))
+            .map(|p| {
+                (
+                    p["text"].as_str().unwrap().to_owned(),
+                    p.get("style").and_then(|s| s.as_str()).map(str::to_owned),
+                )
+            })
             .collect()
     }
 
@@ -347,6 +365,5 @@ mod tests {
     fn prefixes() {
         assert_eq!(common_prefix(&["abc".into(), "abd".into()]), "ab");
         assert_eq!(common_prefix(&["é1".into(), "é2".into()]), "é");
-        assert_eq!(word_before("ls  fo", 6), (4, "fo"));
     }
 }

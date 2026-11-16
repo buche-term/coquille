@@ -32,11 +32,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use coquille::channel::{control_fd, write_line};
+use coquille::protocol;
 use notify::{EventKind, RecursiveMode, Watcher};
-use serde_json::json;
 
 #[derive(Parser)]
-#[command(name = "watch", about = "Run a command, and run it again whenever the files it uses change")]
+#[command(
+    name = "watch",
+    about = "Run a command, and run it again whenever the files it uses change"
+)]
 struct Cli {
     /// Files (or directories) to watch; by default, the command's arguments
     /// that are existing paths. Not needed with --restart
@@ -67,13 +70,20 @@ struct Cli {
     every: Option<Duration>,
 
     /// The command to run
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
     prog: Vec<String>,
 }
 
 /// A duration in seconds, as given on the command line (e.g. 0.5).
 fn seconds(text: &str) -> Result<Duration, String> {
-    let n: f64 = text.parse().map_err(|_| format!("{text:?} is not a number of seconds"))?;
+    let n: f64 = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a number of seconds"))?;
     Duration::try_from_secs_f64(n).map_err(|_| format!("{text:?} is not a number of seconds, 0 or more"))
 }
 
@@ -85,12 +95,15 @@ const POLL: Duration = Duration::from_millis(50);
 /// control channel), there is nothing to reset.
 fn reset() {
     if let Some(fd) = control_fd() {
-        write_line(fd, &json!({ "type": "reset", "from": ["$proc"], "to": ["$term"] }).to_string());
+        write_line(fd, &protocol::reset(["$proc"]).to_string());
     }
 }
 
 fn run(prog: &[String]) -> Result<Child> {
-    Command::new(&prog[0]).args(&prog[1..]).spawn().with_context(|| prog[0].clone())
+    Command::new(&prog[0])
+        .args(&prog[1..])
+        .spawn()
+        .with_context(|| prog[0].clone())
 }
 
 fn main() {
@@ -113,13 +126,17 @@ fn watch(mut cli: Cli) -> Result<()> {
         cli.files.clone()
     };
     if files.is_empty() && !cli.restart {
-        bail!("nothing to watch: give files with -f, or name existing files in the command (--restart and --every need none)");
+        bail!(
+            "nothing to watch: give files with -f, or name existing files in the command (--restart and --every need none)"
+        );
     }
 
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(tx)?;
     for file in &files {
-        watcher.watch(Path::new(file), RecursiveMode::Recursive).with_context(|| file.display().to_string())?;
+        watcher
+            .watch(Path::new(file), RecursiveMode::Recursive)
+            .with_context(|| file.display().to_string())?;
     }
 
     let mut child = Some(run(&cli.prog)?);
@@ -133,7 +150,10 @@ fn watch(mut cli: Cli) -> Result<()> {
         // Wait for a change, or until the next thing to do (or to check on
         // the command, while it runs).
         let start_at = restart_at.map(|at| at.max(last_start + throttle));
-        let next = [quiet_at, start_at, child.as_ref().map(|_| Instant::now() + POLL)].into_iter().flatten().min();
+        let next = [quiet_at, start_at, child.as_ref().map(|_| Instant::now() + POLL)]
+            .into_iter()
+            .flatten()
+            .min();
         // (Never busy-wait for a moment less than a poll away.)
         let next = next.map(|at| at.max(Instant::now() + POLL));
         let event = match next {

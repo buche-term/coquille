@@ -25,6 +25,7 @@ use std::process::{Child, Command, Stdio, exit};
 use std::time::{Duration, Instant};
 
 use coquille::channel::{control_fd, wait_fd, write_line};
+use coquille::protocol;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -147,7 +148,9 @@ const DIST_CONFIG: &str = include_str!("../../../../dist-workspace.toml");
 /// The targets there are releases for (Rust target triples): `targets` in
 /// DIST_CONFIG (a one-line list of quoted strings, as dist writes it).
 fn release_targets() -> Vec<&'static str> {
-    let line = DIST_CONFIG.lines().find_map(|l| l.trim().strip_prefix("targets")?.trim_start().strip_prefix('='));
+    let line = DIST_CONFIG
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("targets")?.trim_start().strip_prefix('='));
     line.unwrap_or_default().split('"').skip(1).step_by(2).collect()
 }
 
@@ -165,14 +168,22 @@ fn target_for(os: &str, arch: &str) -> Option<&'static str> {
         _ => return None,
     };
     let for_host = |rest: &str| rest.starts_with('-') && rest.contains(os);
-    release_targets().into_iter().find(|t| t.strip_prefix(arch).is_some_and(for_host))
+    release_targets()
+        .into_iter()
+        .find(|t| t.strip_prefix(arch).is_some_and(for_host))
 }
 
 /// Where `+ssh` speaks: a GUI cell in buche (through the control channel),
 /// or the terminal when there is no channel.
 enum Ui {
-    Gui { fd: RawFd, open: Cell<bool> },
-    Tty { last_label: RefCell<String>, last_update: Cell<Option<Instant>> },
+    Gui {
+        fd: RawFd,
+        open: Cell<bool>,
+    },
+    Tty {
+        last_label: RefCell<String>,
+        last_update: Cell<Option<Instant>>,
+    },
 }
 
 /// The address of `+ssh`'s cell, where it prompts and shows progress.
@@ -207,8 +218,14 @@ fn mb(n: u64) -> f64 {
 impl Ui {
     fn new() -> Ui {
         match control_fd() {
-            Some(fd) => Ui::Gui { fd, open: Cell::new(false) },
-            None => Ui::Tty { last_label: RefCell::new(String::new()), last_update: Cell::new(None) },
+            Some(fd) => Ui::Gui {
+                fd,
+                open: Cell::new(false),
+            },
+            None => Ui::Tty {
+                last_label: RefCell::new(String::new()),
+                last_update: Cell::new(None),
+            },
         }
     }
 
@@ -220,7 +237,7 @@ impl Ui {
 
     fn configure(&self, label: &str) {
         self.emit(json!({
-            "type": "configure", "kind": "frame", "from": DIALOG, "to": ["$term"],
+            "type": "configure", "kind": "frame", "from": DIALOG, "to": protocol::TERM,
             "label": label, "focus": true,
         }));
     }
@@ -232,22 +249,22 @@ impl Ui {
             return;
         }
         self.configure(label);
-        self.command(json!({ "type": "register_schemas", "schemas": {
+        self.command(protocol::register_schemas(json!({
             "cq-install:init": "(d) => cqInstall.init(d)",
             "cq-install:progress": "(d) => cqInstall.progress(d)",
             "cq-install:message": "(d) => cqInstall.message(d)",
-        }}));
-        self.command(json!({ "type": "html", "content": DIALOG_HTML }));
+        })));
+        self.command(protocol::html(DIALOG_HTML));
     }
 
     fn command(&self, message: Value) {
-        self.emit(json!({ "type": "send", "from": DIALOG, "to": ["$term"], "message": message }));
+        self.emit(protocol::send(DIALOG, message));
     }
 
     /// A `data` command, dispatched in the page on its `$schema` (see
     /// register_schemas in `open`).
     fn data(&self, data: Value) {
-        self.command(json!({ "type": "data", "data": data }));
+        self.command(protocol::data(data));
     }
 
     /// Asks whether to install; true to go ahead.
@@ -258,10 +275,14 @@ impl Ui {
             ));
         };
         self.open(&format!("+ssh {host}"));
-        self.data(json!({ "$schema": "cq-install:init", "host": host, "version": format!("v{VERSION}"), "target": target }));
+        self.data(
+            json!({ "$schema": "cq-install:init", "host": host, "version": format!("v{VERSION}"), "target": target }),
+        );
         // Wait for a click (other messages, if any, are not ours).
         while let Some(line) = read_line(*fd) {
-            let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if message["type"] != "data" {
                 continue;
             }
@@ -281,7 +302,10 @@ impl Ui {
             Ui::Gui { .. } => {
                 self.data(json!({ "$schema": "cq-install:progress", "label": label, "done": done, "total": total }))
             }
-            Ui::Tty { last_label, last_update } => {
+            Ui::Tty {
+                last_label,
+                last_update,
+            } => {
                 let mut last = last_label.borrow_mut();
                 let finished = matches!((done, total), (Some(d), Some(t)) if d >= t);
                 let new_stage = *last != label;
@@ -313,9 +337,7 @@ impl Ui {
         match self {
             Ui::Gui { open, .. } => {
                 if open.get() {
-                    self.emit(json!({
-                        "type": "close", "from": DIALOG, "to": ["$term"], "outcome": { "type": "success" },
-                    }));
+                    self.emit(protocol::close(DIALOG, protocol::outcome(true, None)));
                 }
             }
             Ui::Tty { last_label, .. } => {
@@ -339,7 +361,11 @@ impl Ui {
         }
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
-            let mut pfd = libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 };
+            let mut pfd = libc::pollfd {
+                fd: *fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             if unsafe { libc::poll(&mut pfd, 1, 150) } <= 0 || read_line(*fd).is_none() {
                 return;
             }
@@ -361,7 +387,11 @@ impl Ui {
             }
             Ui::Tty { .. } => {
                 self.finish();
-                let text = if detail.is_empty() { title.to_owned() } else { format!("{title}\n{detail}") };
+                let text = if detail.is_empty() {
+                    title.to_owned()
+                } else {
+                    format!("{title}\n{detail}")
+                };
                 if error {
                     eprintln!("+ssh: {text}");
                 } else {
@@ -399,7 +429,9 @@ fn content_length(url: &str) -> Option<u64> {
     let headers = String::from_utf8_lossy(&out.stdout);
     headers.lines().rev().find_map(|line| {
         let (name, value) = line.split_once(':')?;
-        name.trim().eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())?
     })
 }
 
@@ -444,7 +476,10 @@ fn download(ui: &Ui, target: &str, dir: &Path) -> PathBuf {
     let data = fs::read(&archive).unwrap_or_else(|e| ui.fail(format!("Could not read {name}"), e));
     let actual = hex::encode(Sha256::digest(&data));
     if actual != expected {
-        ui.fail(format!("Checksum mismatch for {name}"), format!("expected {expected}\ngot      {actual}"));
+        ui.fail(
+            format!("Checksum mismatch for {name}"),
+            format!("expected {expected}\ngot      {actual}"),
+        );
     }
     archive
 }

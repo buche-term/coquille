@@ -25,10 +25,14 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use coquille::channel::{control_fd, write_line};
 use coquille::util::{address_of, expand_user, qualify, unqualify, utf16_len, utf16_to_byte};
+use coquille::words::{quote, units, unquote};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
-#[command(name = "sel", about = "Run a command on the prompt's selection; put its output back into the prompt")]
+#[command(
+    name = "sel",
+    about = "Run a command on the prompt's selection; put its output back into the prompt"
+)]
 struct Cli {
     /// Prompt text in which to replace a range (default: from $CQ_CURRENT_COMMAND)
     #[arg(long)]
@@ -67,42 +71,6 @@ struct Cli {
     command: Vec<String>,
 }
 
-/// The [start, end) spans (in characters) of the space-separated units of a
-/// command line, as the shell splits them: spaces in quotes or after a
-/// backslash don't separate.
-fn units(text: &[char]) -> Vec<(usize, usize)> {
-    let n = text.len();
-    let find = |c: char, from: usize| (from..n).find(|&j| text[j] == c);
-    let mut spans = vec![];
-    let mut i = 0;
-    while i < n {
-        if text[i].is_whitespace() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < n && !text[i].is_whitespace() {
-            let c = text[i];
-            if c == '\\' {
-                i += 2;
-            } else if c == '\'' || c == '"' {
-                let mut close = find(c, i + 1);
-                while c == '"'
-                    && let Some(k) = close
-                    && text[k - 1] == '\\'
-                {
-                    close = find(c, k + 1);
-                }
-                i = close.map_or(n, |k| k + 1);
-            } else {
-                i += 1;
-            }
-        }
-        spans.push((start, i.min(n)));
-    }
-    spans
-}
-
 /// Widen [start, end) to the whole units it touches. (Between two units, a
 /// cursor stays an empty range.)
 fn select_unit(text: &[char], mut start: usize, mut end: usize) -> (usize, usize) {
@@ -115,37 +83,6 @@ fn select_unit(text: &[char], mut start: usize, mut end: usize) -> (usize, usize
         }
     }
     (start, end)
-}
-
-/// Shell words, as Python's `shlex.split` makes them (the `shlex` crate's,
-/// but with `#` an ordinary character, not a comment). None: unbalanced
-/// quotes.
-fn split_words(text: &str) -> Option<Vec<String>> {
-    const HASH: char = '\u{E000}';
-    let words = shlex::split(&text.replace('#', &HASH.to_string()))?;
-    Some(words.into_iter().map(|w| w.replace(HASH, "#")).collect())
-}
-
-/// The selection as the shell would read it, if it is one word ('a b' ->
-/// a b); as it is otherwise.
-fn unquote(text: &str) -> String {
-    match split_words(text) {
-        Some(words) if words.len() == 1 => words.into_iter().next().unwrap(),
-        _ => text.to_owned(),
-    }
-}
-
-/// A word quoted for the shell, as Python's `shlex.quote` does it: as is if
-/// it is safe, else in single quotes.
-fn quote(word: &str) -> String {
-    if word.is_empty() {
-        return "''".into();
-    }
-    let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
-    if word.chars().all(safe) {
-        return word.to_owned();
-    }
-    format!("'{}'", word.replace('\'', "'\"'\"'"))
 }
 
 /// A path's directory and last component, as Python's `os.path.split`.
@@ -201,7 +138,9 @@ fn substitute(command: &[String], selection: &str, result: Option<&str>) -> Vec<
 
 /// The lines of a text, as Python's `str.splitlines` makes them.
 fn split_lines(text: &str) -> Vec<String> {
-    let breaks = ['\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}'];
+    let breaks = [
+        '\n', '\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\u{85}', '\u{2028}', '\u{2029}',
+    ];
     let mut lines = vec![];
     let mut rest = text;
     while !rest.is_empty() {
@@ -210,7 +149,11 @@ fn split_lines(text: &str) -> Vec<String> {
             break;
         };
         lines.push(rest[..i].to_owned());
-        let len = if rest[i..].starts_with("\r\n") { 2 } else { rest[i..].chars().next().unwrap().len_utf8() };
+        let len = if rest[i..].starts_with("\r\n") {
+            2
+        } else {
+            rest[i..].chars().next().unwrap().len_utf8()
+        };
         rest = &rest[i + len..];
     }
     lines
@@ -239,7 +182,9 @@ impl Relay {
     fn to_terminal(&self, child: UnixStream) {
         for line in BufReader::new(child).split(b'\n') {
             let Ok(line) = line else { return };
-            let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&line) else { continue };
+            let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
             let to_shell = obj.get("to").and_then(|t| t.get(0)).and_then(Value::as_str) == Some("$shell");
             if to_shell {
                 continue;
@@ -323,7 +268,10 @@ fn run_command(command: &[String], control: Option<RawFd>) -> Result<Outcome, St
         std::thread::spawn(move || relay.to_child(writer));
     }
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    let code = output.status.code().unwrap_or_else(|| 128 + output.status.signal().unwrap_or(0));
+    let code = output
+        .status
+        .code()
+        .unwrap_or_else(|| 128 + output.status.signal().unwrap_or(0));
     Ok(Outcome {
         code,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -342,15 +290,26 @@ fn run(cli: Cli) -> Result<i32, String> {
     let (text, start, end) = match (cli.text, cli.start, cli.end) {
         (Some(text), Some(start), Some(end)) => (text, start, end),
         (text, start, end) => {
-            let current = current.as_ref().ok_or("no --text/--start/--end given and no $CQ_CURRENT_COMMAND")?;
+            let current = current
+                .as_ref()
+                .ok_or("no --text/--start/--end given and no $CQ_CURRENT_COMMAND")?;
             let text = match text {
                 Some(text) => text,
-                None => current.get("text").and_then(Value::as_str).ok_or("no text in $CQ_CURRENT_COMMAND")?.into(),
+                None => current
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or("no text in $CQ_CURRENT_COMMAND")?
+                    .into(),
             };
             // A submission that never went through the prompt (`cq -c`, a
             // command we submitted ourselves) carries no selection: the
             // cursor is at the end of the text.
-            let at = |name| current.pointer(&format!("/selection/{name}")).and_then(Value::as_u64).map(|n| n as usize);
+            let at = |name| {
+                current
+                    .pointer(&format!("/selection/{name}"))
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
+            };
             let start = start.or_else(|| at("start")).unwrap_or(utf16_len(&text));
             let end = end.or_else(|| at("end")).unwrap_or(start);
             (text, start, end)
@@ -386,7 +345,11 @@ fn run(cli: Cli) -> Result<i32, String> {
     eprint!("{}", outcome.stderr);
 
     // Each line of output is shell-quoted; lines are joined with a space.
-    let lines = if outcome.code == 0 { split_lines(&outcome.stdout) } else { vec![] };
+    let lines = if outcome.code == 0 {
+        split_lines(&outcome.stdout)
+    } else {
+        vec![]
+    };
     let mut insert = lines.iter().map(|l| quote(l)).collect::<Vec<_>>().join(" ");
 
     if !lines.is_empty()
@@ -420,14 +383,17 @@ fn run(cli: Cli) -> Result<i32, String> {
         // (an anchor): the prompt's text isn't what we got (that was empty),
         // and is left alone; what we submit takes the focus instead.
         if anchor.is_none() {
-            send(fd, &json!({
-                "type": "configure",
-                "kind": "prompt",
-                "from": ["$proc"],
-                "to": ["$shell"],
-                "focus": true,
-                "input": { "content": { "parts": [{ "text": "" }], "selection": { "start": 0, "end": 0 } } },
-            }));
+            send(
+                fd,
+                &json!({
+                    "type": "configure",
+                    "kind": "prompt",
+                    "from": ["$proc"],
+                    "to": ["$shell"],
+                    "focus": true,
+                    "input": { "content": { "parts": [{ "text": "" }], "selection": { "start": 0, "end": 0 } } },
+                }),
+            );
         }
         // Then submit it as the terminal submits what was typed: a `command`
         // for the shell with the submit action, which echoes the command,
@@ -457,7 +423,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     if anchor.is_some() {
         return Ok(outcome.code);
     }
-    let mut message = json!({ "type": "configure", "kind": "prompt", "from": ["$proc"], "to": ["$shell"], "focus": true });
+    let mut message =
+        json!({ "type": "configure", "kind": "prompt", "from": ["$proc"], "to": ["$shell"], "focus": true });
     if !lines.is_empty() {
         message["input"] = json!({ "content": {
             "parts": [{ "text": new_text }],
@@ -485,26 +452,9 @@ mod tests {
     }
 
     #[test]
-    fn splits_units() {
-        assert_eq!(units(&chars(r#"ls 'a b' "c\" d" e\ f"#)), vec![(0, 2), (3, 8), (9, 16), (17, 21)]);
+    fn selects_units() {
         assert_eq!(select_unit(&chars("cat foo/bar baz"), 6, 6), (4, 11));
         assert_eq!(select_unit(&chars("a  b"), 2, 2), (2, 2));
-    }
-
-    #[test]
-    fn quotes_like_python() {
-        assert_eq!(quote(""), "''");
-        assert_eq!(quote("a/b-c.d=e%f"), "a/b-c.d=e%f");
-        assert_eq!(quote("it's"), r#"'it'"'"'s'"#);
-        assert_eq!(quote("a b"), "'a b'");
-    }
-
-    #[test]
-    fn unquotes_one_word() {
-        assert_eq!(unquote("'a b'"), "a b");
-        assert_eq!(unquote("#x"), "#x");
-        assert_eq!(unquote("a b"), "a b");
-        assert_eq!(unquote("'open"), "'open");
     }
 
     #[test]
@@ -519,11 +469,17 @@ mod tests {
     #[test]
     fn substitutes() {
         let cmd = vec!["-q".into(), "%basename".into(), "%dirname/x".into(), "100%".into()];
-        assert_eq!(substitute(&cmd, "'src/my file'", None), vec!["-q", "my file", "src/x", "100%"]);
+        assert_eq!(
+            substitute(&cmd, "'src/my file'", None),
+            vec!["-q", "my file", "src/x", "100%"]
+        );
         assert_eq!(substitute(&cmd, "f", None)[2], "./x");
         assert_eq!(substitute(&["bed %result".into()], "", Some("a b")), vec!["bed a b"]);
         let home = std::env::var("HOME").unwrap();
-        assert_eq!(substitute(&["%selection".into()], "~/x", None), vec![format!("{home}/x")]);
+        assert_eq!(
+            substitute(&["%selection".into()], "~/x", None),
+            vec![format!("{home}/x")]
+        );
     }
 
     #[test]

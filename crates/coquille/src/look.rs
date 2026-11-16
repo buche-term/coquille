@@ -34,7 +34,10 @@ pub fn styled_all(text: &str, style: &str) -> Value {
 /// A program's icon: its initial, in cursive and `color`.
 pub fn program_icon(program: &str, color: Option<&str>) -> Value {
     let base = program.rsplit('/').next().unwrap_or(program);
-    let initial = base.chars().find(|c| c.is_alphanumeric()).map_or("?".into(), |c| c.to_uppercase().to_string());
+    let initial = base
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map_or("?".into(), |c| c.to_uppercase().to_string());
     let mut icon = json!({ "type": "glyph", "text": initial, "font": "cursive" });
     if let Some(color) = color.filter(|c| !c.is_empty()) {
         icon["color"] = json!(color);
@@ -90,7 +93,10 @@ pub fn with_program_look(mut event: Message, program: &str, color: Option<&str>)
 /// placeholder the terminal's look (a console icon and a monospace label),
 /// and that look, for its `$stdout` to be declared with once its output
 /// comes (see Process::stdout_look). Nothing without a decoration.
-pub fn terminal_decorations(process_addr: &[String], decoration: Option<&Map<String, Value>>) -> (Option<Message>, Value) {
+pub fn terminal_decorations(
+    process_addr: &[String],
+    decoration: Option<&Map<String, Value>>,
+) -> (Option<Message>, Value) {
     let Some(label) = decoration.and_then(|d| d.get("label")) else {
         return (None, json!({}));
     };
@@ -101,7 +107,7 @@ pub fn terminal_decorations(process_addr: &[String], decoration: Option<&Map<Str
     let look = json!({ "label": styled_all(&verb, "mono"), "icon": console_icon() });
     let mut from = process_addr.to_vec();
     from.push("?".into());
-    let message = crate::util::merged(json!({ "type": "configure", "from": from, "to": ["$term"] }), look.clone());
+    let message = crate::protocol::configure(from, look.clone());
     (Some(message), look)
 }
 
@@ -142,7 +148,10 @@ mod tests {
 
     #[test]
     fn icons() {
-        assert_eq!(program_icon("/usr/bin/ls", Some("red")), json!({"type": "glyph", "text": "L", "font": "cursive", "color": "red"}));
+        assert_eq!(
+            program_icon("/usr/bin/ls", Some("red")),
+            json!({"type": "glyph", "text": "L", "font": "cursive", "color": "red"})
+        );
         assert_eq!(program_icon("./-", None)["text"], "?");
     }
 }

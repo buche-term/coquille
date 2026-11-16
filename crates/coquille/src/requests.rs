@@ -5,6 +5,8 @@
 
 use serde_json::{Value, json};
 
+use crate::protocol;
+
 /// A pending request, as the requests view shows it.
 #[derive(Clone, Debug)]
 pub struct PendingRequest {
@@ -52,14 +54,22 @@ pub fn pending_summary(requests: &[PendingRequest]) -> Option<String> {
 }
 
 /// The requests view's page. It shows the requests it is given with
-/// `cqRender(requests)` (see render_requests), and answers with `{request,
+/// `cqRender(requests)` (see requests_schemas), and answers with `{request,
 /// answer}` (approve or ignore) or `{dismiss: true}` (Escape). Keyboard: ↑/↓
 /// (or k/j) select, Enter or a approves, i or Delete ignores, Escape closes.
 pub const REQUESTS_HTML: &str = include_str!("../resources/requests.html");
 
-/// The view command that shows `requests` (an `exec`: our own code, the
-/// requests as JSON data in it).
+/// The `$schema` of the data that shows requests in the view.
+const RENDER_SCHEMA: &str = "cq-requests:render";
+
+/// The view command that has the page show the data of RENDER_SCHEMA (see
+/// render_requests), sent before its page.
+pub fn requests_schemas() -> Value {
+    protocol::register_schemas(json!({ RENDER_SCHEMA: "(d) => window.cqRender(d.requests)" }))
+}
+
+/// The view command that shows `requests` (data: see requests_schemas).
 pub fn render_requests(requests: &[PendingRequest]) -> Value {
-    let data = Value::Array(requests.iter().map(PendingRequest::to_json).collect());
-    json!({ "type": "exec", "code": format!("window.cqRender({data})") })
+    let requests: Vec<Value> = requests.iter().map(PendingRequest::to_json).collect();
+    protocol::data(json!({ "$schema": RENDER_SCHEMA, "requests": requests }))
 }

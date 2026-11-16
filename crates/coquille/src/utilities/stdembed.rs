@@ -1,16 +1,19 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::ffi::{CString, OsString};
+use std::ffi::OsString;
 use std::io::Error;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_void};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::RawFd;
-use std::process::exit;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, exit};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+use coquille::channel::write_all;
+use coquille::util::{DEFAULT_TERMINAL_SIZE, buche_terminal_size, cwd, find_executable, tty_size};
 
 const ESC: u8 = 0x1b;
 const STX: u8 = 0x02;
@@ -38,8 +41,10 @@ stdembed: test harness for the +ssh fd-multiplexing protocol.
 
 static LAST_SIG: AtomicI32 = AtomicI32::new(0);
 static MASTER_FD: AtomicI32 = AtomicI32::new(-1);
-static ENV_ROWS: AtomicI32 = AtomicI32::new(-1);
-static ENV_COLS: AtomicI32 = AtomicI32::new(-1);
+/// buche's terminal size (see buche_terminal_size), read once (0: not
+/// given): the SIGWINCH handler can't read the environment.
+static ENV_COLS: AtomicU16 = AtomicU16::new(0);
+static ENV_ROWS: AtomicU16 = AtomicU16::new(0);
 
 /// The readiness handshake. The wrapping end (-w) announces itself with an
 /// empty frame on fd 0 (READY_FD) as soon as it is set up, its terminal in
@@ -56,9 +61,7 @@ const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 static PEER_READY: AtomicBool = AtomicBool::new(false);
 
 fn ready_frame() -> Vec<u8> {
-    let mut frame = start_seq(READY_FD);
-    frame.extend_from_slice(&END_SEQ);
-    frame
+    frame(READY_FD, &[])
 }
 
 /// Where -u sends a frame from the channel: to its local fd (the ready
@@ -66,7 +69,7 @@ fn ready_frame() -> Vec<u8> {
 fn unwrap_sink(n: i32, d: &[u8]) {
     PEER_READY.store(true, Ordering::SeqCst);
     if n != READY_FD {
-        write_once(n as RawFd, d);
+        write_all(n as RawFd, d);
     }
 }
 
@@ -131,65 +134,24 @@ fn py_int(s: &str) -> Option<i64> {
     Some(sign * val)
 }
 
-fn env_int0(name: &str) -> i64 {
-    match env::var_os(name) {
-        None => 0,
-        Some(v) => {
-            let s = match String::from_utf8(v.as_bytes().to_vec()) {
-                Ok(s) => s,
-                Err(_) => {
-                    eprintln!("ValueError: invalid environment variable {name}");
-                    exit(1)
-                }
-            };
-            if s.is_empty() {
-                return 0;
-            }
-            match py_int(&s) {
-                Some(n) => n,
-                None => {
-                    eprintln!("ValueError: invalid literal for int() with base 10: '{s}'");
-                    exit(1)
-                }
-            }
-        }
-    }
-}
-
-fn winsize_of(rows: u16, cols: u16) -> libc::winsize {
+/// The size the command's PTY gets: buche's, else our terminal's, else the
+/// default, dimension by dimension (as cq's: see terminal_size).
+/// Async-signal-safe (see ENV_COLS).
+fn winsize_now() -> libc::winsize {
+    let (tty_cols, tty_rows) = tty_size(0).unwrap_or((0, 0));
+    let pick = |env: u16, tty: u16, default: u16| [env, tty].into_iter().find(|&n| n > 0).unwrap_or(default);
     libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
+        ws_col: pick(ENV_COLS.load(Ordering::SeqCst), tty_cols, DEFAULT_TERMINAL_SIZE.0),
+        ws_row: pick(ENV_ROWS.load(Ordering::SeqCst), tty_rows, DEFAULT_TERMINAL_SIZE.1),
         ws_xpixel: 0,
         ws_ypixel: 0,
     }
 }
 
-fn winsize_now() -> libc::winsize {
-    let rows = ENV_ROWS.load(Ordering::SeqCst);
-    let cols = ENV_COLS.load(Ordering::SeqCst);
-    if rows > 0 && cols > 0 {
-        return winsize_of(rows as u16, cols as u16);
-    }
-    let mut ws: libc::winsize = unsafe { MaybeUninit::zeroed().assume_init() };
-    if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws as *mut libc::winsize) } == 0 {
-        ws
-    } else {
-        winsize_of(24, 80)
-    }
-}
-
 fn init_env_size_cache() {
-    let rows = env_int0("BUCHE_PTY_ROWS");
-    let cols = env_int0("BUCHE_PTY_COLS");
-    if rows != 0 && cols != 0 {
-        if rows < 0 || rows > 65535 || cols < 0 || cols > 65535 {
-            eprintln!("struct.error");
-            exit(1);
-        }
-        ENV_ROWS.store(rows as i32, Ordering::SeqCst);
-        ENV_COLS.store(cols as i32, Ordering::SeqCst);
-    }
+    let (cols, rows) = buche_terminal_size();
+    ENV_COLS.store(cols.unwrap_or(0), Ordering::SeqCst);
+    ENV_ROWS.store(rows.unwrap_or(0), Ordering::SeqCst);
 }
 
 fn set_winsize(fd: RawFd) {
@@ -202,9 +164,7 @@ fn is_tty(fd: RawFd) -> bool {
 }
 
 fn want_pty() -> bool {
-    is_tty(0)
-        || env::var_os("BUCHE_PTY_ROWS").is_some()
-        || env::var_os("BUCHE_PTY_COLS").is_some()
+    is_tty(0) || env::var_os("BUCHE_PTY_ROWS").is_some() || env::var_os("BUCHE_PTY_COLS").is_some()
 }
 
 fn close_fd(fd: RawFd) {
@@ -226,23 +186,15 @@ fn fd_read(fd: RawFd, n: usize) -> Vec<u8> {
     }
 }
 
-fn write_once(fd: RawFd, data: &[u8]) {
-    unsafe { libc::write(fd, data.as_ptr() as *const c_void, data.len()) };
-}
-
-fn write_loop(fd: RawFd, mut data: &[u8]) {
-    while !data.is_empty() {
-        let n = unsafe { libc::write(fd, data.as_ptr() as *const c_void, data.len()) };
-        if n < 0 {
-            if Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
+/// Read `fd` until its end, 4096 bytes at a time, handing each chunk to
+/// `chunk`.
+fn pump(fd: RawFd, mut chunk: impl FnMut(&[u8])) {
+    loop {
+        let data = fd_read(fd, 4096);
+        if data.is_empty() {
             return;
         }
-        if n == 0 {
-            return;
-        }
-        data = &data[n as usize..];
+        chunk(&data);
     }
 }
 
@@ -261,7 +213,7 @@ impl LockedWriter {
 
     fn write(&self, data: &[u8]) {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        write_loop(self.fd, data);
+        write_all(self.fd, data);
     }
 }
 
@@ -272,6 +224,14 @@ fn start_seq(fd: i32) -> Vec<u8> {
     v.push(STX);
     v.extend_from_slice(s.as_bytes());
     v
+}
+
+/// `data`, framed as fd `fd`'s.
+fn frame(fd: i32, data: &[u8]) -> Vec<u8> {
+    let mut frame = start_seq(fd);
+    frame.extend_from_slice(data);
+    frame.extend_from_slice(&END_SEQ);
+    frame
 }
 
 fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
@@ -425,10 +385,7 @@ fn wait_child(pid: libc::pid_t, kill_on_int: bool) -> c_int {
             return status;
         }
         if Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            if kill_on_int
-                && !forwarded
-                && LAST_SIG.load(Ordering::SeqCst) == libc::SIGINT
-            {
+            if kill_on_int && !forwarded && LAST_SIG.load(Ordering::SeqCst) == libc::SIGINT {
                 unsafe { libc::kill(pid, libc::SIGINT) };
                 forwarded = true;
             }
@@ -508,10 +465,7 @@ fn pump_extra_fds(w: &Arc<LockedWriter>, done: &AtomicBool) {
                 if chunk.is_empty() {
                     dead.push(p.fd);
                 } else {
-                    let mut frame = start_seq(p.fd);
-                    frame.extend_from_slice(&chunk);
-                    frame.extend_from_slice(&END_SEQ);
-                    w.write(&frame);
+                    w.write(&frame(p.fd, &chunk));
                 }
             }
         }
@@ -519,111 +473,20 @@ fn pump_extra_fds(w: &Arc<LockedWriter>, done: &AtomicBool) {
     }
 }
 
-fn pump_wrap_fd(fd: RawFd, fdnum: i32, w: &Arc<LockedWriter>) {
-    loop {
-        let chunk = fd_read(fd, 4096);
-        if chunk.is_empty() {
-            break;
-        }
-        let mut frame = start_seq(fdnum);
-        frame.extend_from_slice(&chunk);
-        frame.extend_from_slice(&END_SEQ);
-        w.write(&frame);
-    }
-}
-
-fn env_vars_copy() -> BTreeMap<OsString, OsString> {
-    env::vars_os().collect()
-}
-
-fn cstring_of(s: &OsString) -> Option<CString> {
-    CString::new(s.as_bytes().to_vec()).ok()
+/// Frame what `fd` says as fd `fdnum`'s, onto `w`, until its end.
+fn pump_framed(fd: RawFd, fdnum: i32, w: &LockedWriter) {
+    pump(fd, |chunk| w.write(&frame(fdnum, chunk)));
 }
 
 fn child_error(msg: &str) -> ! {
     let line = format!("stdembed: child setup error: {msg}\n");
-    write_once(2, line.as_bytes());
+    write_all(2, line.as_bytes());
     unsafe { libc::_exit(127) };
 }
 
-fn path_candidates<'a>(prog: &'a OsString, env_map: &BTreeMap<OsString, OsString>) -> Vec<OsString> {
-    let bytes = prog.as_bytes();
-    if bytes.contains(&b'/') {
-        return vec![prog.clone()];
-    }
-    let default = OsString::from(":/bin:/usr/bin");
-    let path = env_map
-        .get(&OsString::from("PATH"))
-        .cloned()
-        .unwrap_or(default);
-    path.as_bytes()
-        .split(|&c| c == b':')
-        .map(|dir| {
-            if dir.is_empty() {
-                prog.clone()
-            } else {
-                let mut v = dir.to_vec();
-                v.push(b'/');
-                v.extend_from_slice(bytes);
-                OsString::from_vec(v)
-            }
-        })
-        .collect()
-}
-
-fn search_path(prog: &OsString, env_map: &BTreeMap<OsString, OsString>) -> Option<OsString> {
-    for cand in path_candidates(prog, env_map) {
-        let mut st: libc::stat = unsafe { MaybeUninit::zeroed().assume_init() };
-        if let Some(c) = cstring_of(&cand) {
-            if unsafe { libc::stat(c.as_ptr(), &mut st) } == 0 {
-                return Some(cand);
-            }
-        }
-    }
-    None
-}
-
-fn exec_child(cmd: &[OsString], env_map: &BTreeMap<OsString, OsString>) -> ! {
-    if cmd.is_empty() {
-        child_error("list index out of range");
-    }
-    let mut argv: Vec<CString> = Vec::with_capacity(cmd.len());
-    for a in cmd {
-        match cstring_of(a) {
-            Some(c) => argv.push(c),
-            None => child_error("embedded null byte"),
-        }
-    }
-    let mut argv_p: Vec<*const c_char> = argv.iter().map(|c| c.as_ptr()).collect();
-    argv_p.push(ptr::null());
-    let mut envv: Vec<CString> = Vec::new();
-    for (k, v) in env_map {
-        let mut kv = k.clone();
-        kv.push("=");
-        kv.push(v);
-        match cstring_of(&kv) {
-            Some(c) => envv.push(c),
-            None => child_error("embedded null byte"),
-        }
-    }
-    let mut env_p: Vec<*const c_char> = envv.iter().map(|c| c.as_ptr()).collect();
-    env_p.push(ptr::null());
-    for cand in path_candidates(&cmd[0], env_map) {
-        if let Some(c) = cstring_of(&cand) {
-            unsafe { libc::execve(c.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
-        }
-    }
-    child_error(&format!(
-        "[Errno 2] No such file or directory: '{}'",
-        cmd[0].to_string_lossy()
-    ));
-}
-
-fn child_setup_and_exec(
-    cmd: &[OsString],
-    env_map: &BTreeMap<OsString, OsString>,
-    map: &BTreeMap<RawFd, RawFd>,
-) -> ! {
+/// In the child, once forked: its fds as `map` says (destination: source),
+/// all others closed, then `cmd` (looked up in its PATH) run with `env`.
+fn child_setup_and_exec(cmd: &[OsString], env: &BTreeMap<OsString, OsString>, map: &BTreeMap<RawFd, RawFd>) -> ! {
     const HI: RawFd = 100;
     let dsts: Vec<RawFd> = map.keys().copied().collect();
     let srcs: Vec<RawFd> = dsts.iter().map(|d| *map.get(d).unwrap()).collect();
@@ -652,340 +515,170 @@ fn child_setup_and_exec(
     for fd in (keep + 1)..maxfd {
         unsafe { libc::close(fd) };
     }
-    exec_child(cmd, env_map);
+    let err = Command::new(&cmd[0]).args(&cmd[1..]).env_clear().envs(env).exec();
+    child_error(&format!("{}: {err}", cmd[0].to_string_lossy()))
 }
 
-fn run_unwrap_pipe(cmd: &[OsString]) -> ! {
-    if cmd.is_empty() {
-        eprintln!("IndexError: list index out of range");
-        exit(1);
-    }
-    let env_map = env_vars_copy();
-    if search_path(&cmd[0], &env_map).is_none() {
-        eprintln!(
-            "FileNotFoundError: [Errno 2] No such file or directory: '{}'",
-            cmd[0].to_string_lossy()
-        );
-        exit(1);
-    }
-    let (in_r, in_w) = make_pipe();
-    let (out_r, out_w) = make_pipe();
-    let pid = fork();
-    if pid == 0 {
-        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
-        let mut map: BTreeMap<RawFd, RawFd> = BTreeMap::new();
-        map.insert(0 as RawFd, in_r);
-        map.insert(1 as RawFd, out_w);
-        child_setup_and_exec(cmd, &env_map, &map);
-    }
-    close_fd(in_r);
-    close_fd(out_w);
-
-    let w_out = LockedWriter::new(1);
-    let w_child = LockedWriter::new(in_w);
-    let done = Arc::new(AtomicBool::new(false));
-
-    {
-        let (w, done, fd) = (w_out.clone(), done.clone(), out_r);
-        thread::spawn(move || {
-            let mut parser = StreamParser::new();
-            loop {
-                let chunk = fd_read(fd, 4096);
-                if chunk.is_empty() {
-                    break;
-                }
-                parser.feed(
-                    &chunk,
-                    &mut |d| w.write(d),
-                    &mut |n, d| unwrap_sink(n, d),
-                );
-            }
-            done.store(true, Ordering::SeqCst);
-        });
-    }
-    {
-        let (w, fd) = (w_child.clone(), in_w);
-        thread::spawn(move || {
-            loop {
-                let chunk = fd_read(0, 4096);
-                if chunk.is_empty() {
-                    break;
-                }
-                w.write(&chunk);
-            }
-            close_fd(fd);
-        });
-    }
-    {
-        let (w, done) = (w_child, done);
-        thread::spawn(move || pump_extra_fds(&w, &done));
-    }
-
-    let status = wait_child(pid, false);
-    exit_with_status(status)
+/// The command, running: its terminal side is a PTY (`input` and `output`
+/// both its master), or pipes to its stdin and from its stdout.
+struct Child {
+    pid: libc::pid_t,
+    input: RawFd,
+    output: RawFd,
+    pty: bool,
 }
 
-fn run_unwrap_pty(cmd: &[OsString]) -> ! {
-    init_env_size_cache();
-    let (master, slave) = open_pty();
-    set_winsize(master);
-    let env_map = env_vars_copy();
-    let pid = fork();
-    if pid == 0 {
-        close_fd(master);
-        unsafe { libc::setsid() };
-        // `as _` because ioctl's request is c_ulong on macOS but c_int on Linux.
-        unsafe { libc::ioctl(slave, libc::TIOCSCTTY as _, 0) };
-        let mut map: BTreeMap<RawFd, RawFd> = BTreeMap::new();
-        map.insert(0 as RawFd, slave);
-        map.insert(1 as RawFd, slave);
-        map.insert(2 as RawFd, slave);
-        child_setup_and_exec(cmd, &env_map, &map);
-    }
-    close_fd(slave);
-    MASTER_FD.store(master, Ordering::SeqCst);
-    unsafe { set_sigaction(libc::SIGWINCH, winch_handler) };
-
-    let w_out = LockedWriter::new(1);
-    let w_master = LockedWriter::new(master);
-    let done = Arc::new(AtomicBool::new(false));
-    let old = grab_raw_stdin();
-
-    {
-        let (w, done, fd) = (w_out.clone(), done.clone(), master);
-        thread::spawn(move || {
-            let mut parser = StreamParser::new();
-            loop {
-                let chunk = fd_read(fd, 4096);
-                if chunk.is_empty() {
-                    break;
-                }
-                parser.feed(
-                    &chunk,
-                    &mut |d| w.write(d),
-                    &mut |n, d| unwrap_sink(n, d),
-                );
-            }
-            done.store(true, Ordering::SeqCst);
-        });
-    }
-    {
-        let w = w_master.clone();
-        thread::spawn(move || {
-            loop {
-                let chunk = fd_read(0, 4096);
-                if chunk.is_empty() {
-                    break;
-                }
-                w.write(&chunk);
-            }
-        });
-    }
-    {
-        let (w, done) = (w_master, done);
-        thread::spawn(move || pump_extra_fds(&w, &done));
-    }
-
-    let status = wait_child(pid, true);
-    restore_stdin(old);
-    close_fd(master);
-    exit_with_status(status)
-}
-
-fn run_unwrap(cmd: &[OsString]) -> ! {
-    if want_pty() {
-        run_unwrap_pty(cmd)
+/// Start `cmd` with `env`: on a PTY (its stdin, stdout and stderr) if `pty`,
+/// else with pipes for its stdin and stdout; its other fds as `fds` says
+/// (destination, source: the sources are closed here once it has them), and
+/// our `own` fds closed in it.
+fn spawn(
+    cmd: &[OsString],
+    env: &BTreeMap<OsString, OsString>,
+    pty: bool,
+    fds: &[(RawFd, RawFd)],
+    own: &[RawFd],
+) -> Child {
+    let mut map: BTreeMap<RawFd, RawFd> = fds.iter().copied().collect();
+    let (input, output, theirs) = if pty {
+        init_env_size_cache();
+        let (master, slave) = open_pty();
+        set_winsize(master);
+        map.extend([(0, slave), (1, slave), (2, slave)]);
+        (master, master, vec![slave])
     } else {
-        run_unwrap_pipe(cmd)
+        let (in_r, in_w) = make_pipe();
+        let (out_r, out_w) = make_pipe();
+        map.extend([(0, in_r), (1, out_w)]);
+        (in_w, out_r, vec![in_r, out_w])
+    };
+    let pid = fork();
+    if pid == 0 {
+        if pty {
+            close_fd(input);
+            unsafe { libc::setsid() };
+            // `as _` because ioctl's request is c_ulong on macOS but c_int on Linux.
+            unsafe { libc::ioctl(theirs[0], libc::TIOCSCTTY as _, 0) };
+        }
+        for &fd in own {
+            close_fd(fd);
+        }
+        child_setup_and_exec(cmd, env, &map);
+    }
+    for fd in theirs.into_iter().chain(fds.iter().map(|&(_, src)| src)) {
+        close_fd(fd);
+    }
+    if pty {
+        MASTER_FD.store(input, Ordering::SeqCst);
+        unsafe { set_sigaction(libc::SIGWINCH, winch_handler) };
+    }
+    Child {
+        pid,
+        input,
+        output,
+        pty,
     }
 }
 
-fn run_wrap_pipe(
-    cmd: &[OsString],
-    pipe3_r: RawFd,
-    pipe3_w: RawFd,
-    pipe4_r: RawFd,
-    pipe4_w: RawFd,
-    local5: RawFd,
-    remote5: RawFd,
-    env_map: &BTreeMap<OsString, OsString>,
-) -> ! {
-    let (cin_r, cin_w) = make_pipe();
-    let (cout_r, cout_w) = make_pipe();
-    let pid = fork();
-    if pid == 0 {
-        close_fd(local5);
-        let mut map: BTreeMap<RawFd, RawFd> = BTreeMap::new();
-        map.insert(0 as RawFd, cin_r);
-        map.insert(1 as RawFd, cout_w);
-        map.insert(3 as RawFd, pipe3_r);
-        map.insert(4 as RawFd, pipe4_w);
-        map.insert(5 as RawFd, remote5);
-        child_setup_and_exec(cmd, env_map, &map);
-    }
-    close_fd(cin_r);
-    close_fd(cout_w);
-    close_fd(pipe3_r);
-    close_fd(pipe4_w);
-    close_fd(remote5);
-
-    let w_out = LockedWriter::new(1);
-    let w_in = LockedWriter::new(cin_w);
-    w_out.write(&ready_frame());
-
-    {
-        let (w, fd) = (w_out.clone(), cout_r);
-        thread::spawn(move || loop {
-            let chunk = fd_read(fd, 4096);
-            if chunk.is_empty() {
-                break;
-            }
-            w.write(&chunk);
-        });
-    }
-    {
-        let (w, p3, p5, cin) = (w_in.clone(), pipe3_w, local5, cin_w);
-        thread::spawn(move || {
-            let mut parser = StreamParser::new();
-            loop {
-                let chunk = fd_read(0, 4096);
-                if chunk.is_empty() {
-                    break;
-                }
-                parser.feed(
-                    &chunk,
-                    &mut |d| w.write(d),
-                    &mut |n, d| match n {
-                        3 => write_loop(p3, d),
-                        5 => write_loop(p5, d),
-                        _ => {}
-                    },
-                );
-            }
-            close_fd(cin);
-        });
-    }
-    {
-        let w = w_out.clone();
-        thread::spawn(move || pump_wrap_fd(pipe4_r, 4, &w));
-    }
-    {
-        let w = w_out;
-        thread::spawn(move || pump_wrap_fd(local5, 5, &w));
-    }
-
-    let status = wait_child(pid, false);
-    close_fd(pipe3_w);
-    close_fd(pipe4_r);
-    close_fd(local5);
-    exit_with_status(status)
-}
-
-fn run_wrap_pty(
-    cmd: &[OsString],
-    pipe3_r: RawFd,
-    pipe3_w: RawFd,
-    pipe4_r: RawFd,
-    pipe4_w: RawFd,
-    local5: RawFd,
-    remote5: RawFd,
-    env_map: &BTreeMap<OsString, OsString>,
-) -> ! {
-    init_env_size_cache();
-    let (master, slave) = open_pty();
-    set_winsize(master);
-    let pid = fork();
-    if pid == 0 {
-        close_fd(master);
-        close_fd(local5);
-        unsafe { libc::setsid() };
-        // `as _` because ioctl's request is c_ulong on macOS but c_int on Linux.
-        unsafe { libc::ioctl(slave, libc::TIOCSCTTY as _, 0) };
-        let mut map: BTreeMap<RawFd, RawFd> = BTreeMap::new();
-        map.insert(0 as RawFd, slave);
-        map.insert(1 as RawFd, slave);
-        map.insert(2 as RawFd, slave);
-        map.insert(3 as RawFd, pipe3_r);
-        map.insert(4 as RawFd, pipe4_w);
-        map.insert(5 as RawFd, remote5);
-        child_setup_and_exec(cmd, env_map, &map);
-    }
-    close_fd(slave);
-    close_fd(pipe3_r);
-    close_fd(pipe4_w);
-    close_fd(remote5);
-    MASTER_FD.store(master, Ordering::SeqCst);
-    unsafe { set_sigaction(libc::SIGWINCH, winch_handler) };
-
-    let w_out = LockedWriter::new(1);
-    let w_master = LockedWriter::new(master);
-    let old = grab_raw_stdin();
-    w_out.write(&ready_frame());
-
-    {
-        let (w, fd) = (w_out.clone(), master);
-        thread::spawn(move || loop {
-            let chunk = fd_read(fd, 4096);
-            if chunk.is_empty() {
-                break;
-            }
-            w.write(&chunk);
-        });
-    }
-    {
-        let (w, p3, p5) = (w_master.clone(), pipe3_w, local5);
-        thread::spawn(move || {
-            let mut parser = StreamParser::new();
-            loop {
-                let chunk = fd_read(0, 4096);
-                if chunk.is_empty() {
-                    break;
-                }
-                parser.feed(
-                    &chunk,
-                    &mut |d| w.write(d),
-                    &mut |n, d| match n {
-                        3 => write_loop(p3, d),
-                        5 => write_loop(p5, d),
-                        _ => {}
-                    },
-                );
-            }
-        });
-    }
-    {
-        let w = w_out.clone();
-        thread::spawn(move || pump_wrap_fd(pipe4_r, 4, &w));
-    }
-    {
-        let w = w_out;
-        thread::spawn(move || pump_wrap_fd(local5, 5, &w));
-    }
-
-    let status = wait_child(pid, true);
+/// Wait for the command to end (a SIGINT forwarded to it, on a PTY), put
+/// things back, close `fds`, and exit as it did.
+fn finish(child: Child, old: Option<libc::termios>, fds: &[RawFd]) -> ! {
+    let status = wait_child(child.pid, child.pty);
     restore_stdin(old);
-    close_fd(master);
-    close_fd(pipe3_w);
-    close_fd(pipe4_r);
-    close_fd(local5);
+    if child.pty {
+        close_fd(child.input);
+    }
+    for &fd in fds {
+        close_fd(fd);
+    }
     exit_with_status(status)
 }
 
+/// -u: run the channel command; demultiplex what it outputs, and multiplex
+/// our fd3/fd5 into its input (see DOC).
+fn run_unwrap(cmd: &[OsString]) -> ! {
+    let pty = want_pty();
+    let env: BTreeMap<OsString, OsString> = env::vars_os().collect();
+    if !pty {
+        let path = env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+        let prog = cmd[0].to_string_lossy();
+        if !find_executable(&prog, &path, &cwd()).is_some_and(|exe| exe.exists()) {
+            eprintln!("FileNotFoundError: [Errno 2] No such file or directory: '{prog}'");
+            exit(1);
+        }
+    }
+    let child = spawn(cmd, &env, pty, &[], &[]);
+    let w_out = LockedWriter::new(1);
+    let w_child = LockedWriter::new(child.input);
+    let done = Arc::new(AtomicBool::new(false));
+    let old = grab_raw_stdin();
+
+    {
+        let (w, done, fd) = (w_out, done.clone(), child.output);
+        thread::spawn(move || {
+            let mut parser = StreamParser::new();
+            pump(fd, |chunk| {
+                parser.feed(chunk, &mut |d| w.write(d), &mut |n, d| unwrap_sink(n, d))
+            });
+            done.store(true, Ordering::SeqCst);
+        });
+    }
+    {
+        let (w, fd) = (w_child.clone(), child.input);
+        thread::spawn(move || {
+            pump(0, |chunk| w.write(chunk));
+            if !pty {
+                close_fd(fd);
+            }
+        });
+    }
+    thread::spawn(move || pump_extra_fds(&w_child, &done));
+
+    finish(child, old, &[])
+}
+
+/// -w: run the command with fd3/fd5 (see DOC); demultiplex our input into
+/// its, and multiplex its fd4/fd5 into our output.
 fn run_wrap(cmd: &[OsString]) -> ! {
+    let pty = want_pty();
     let (pipe3_r, pipe3_w) = make_pipe();
     let (pipe4_r, pipe4_w) = make_pipe();
     let (local5, remote5) = make_socketpair();
-    let mut env_map = env_vars_copy();
-    env_map.insert(OsString::from("BUCHE_CONTROL_FD"), OsString::from("5"));
-    if want_pty() {
-        run_wrap_pty(
-            cmd, pipe3_r, pipe3_w, pipe4_r, pipe4_w, local5, remote5, &env_map,
-        )
-    } else {
-        run_wrap_pipe(
-            cmd, pipe3_r, pipe3_w, pipe4_r, pipe4_w, local5, remote5, &env_map,
-        )
+    let mut env: BTreeMap<OsString, OsString> = env::vars_os().collect();
+    env.insert(OsString::from("BUCHE_CONTROL_FD"), OsString::from("5"));
+    let child = spawn(cmd, &env, pty, &[(3, pipe3_r), (4, pipe4_w), (5, remote5)], &[local5]);
+    let w_out = LockedWriter::new(1);
+    let w_in = LockedWriter::new(child.input);
+    let old = grab_raw_stdin();
+    w_out.write(&ready_frame());
+
+    {
+        let (w, fd) = (w_out.clone(), child.output);
+        thread::spawn(move || pump(fd, |chunk| w.write(chunk)));
     }
+    {
+        let fd = child.input;
+        thread::spawn(move || {
+            let mut parser = StreamParser::new();
+            pump(0, |chunk| {
+                parser.feed(chunk, &mut |d| w_in.write(d), &mut |n, d| match n {
+                    3 => write_all(pipe3_w, d),
+                    5 => write_all(local5, d),
+                    _ => {}
+                })
+            });
+            if !pty {
+                close_fd(fd);
+            }
+        });
+    }
+    {
+        let w = w_out.clone();
+        thread::spawn(move || pump_framed(pipe4_r, 4, &w));
+    }
+    thread::spawn(move || pump_framed(local5, 5, &w_out));
+
+    finish(child, old, &[pipe3_w, pipe4_r, local5])
 }
 
 fn py_repr(s: &str) -> String {
@@ -1013,17 +706,10 @@ fn py_repr(s: &str) -> String {
 }
 
 fn print_size() -> ! {
-    let rows = env_int0("BUCHE_PTY_ROWS");
-    let cols = env_int0("BUCHE_PTY_COLS");
-    if rows != 0 && cols != 0 {
-        println!("('buche', {rows}, {cols})");
-        exit(0);
-    }
-    let mut ws: libc::winsize = unsafe { MaybeUninit::zeroed().assume_init() };
-    if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws as *mut libc::winsize) } == 0 {
-        println!("('winsz', {}, {})", ws.ws_row, ws.ws_col);
-    } else {
-        println!("b'\\x18\\x00P\\x00\\x00\\x00\\x00\\x00'");
+    match (buche_terminal_size(), tty_size(0)) {
+        ((Some(cols), Some(rows)), _) => println!("('buche', {rows}, {cols})"),
+        (_, Some((cols, rows))) => println!("('winsz', {rows}, {cols})"),
+        _ => println!("b'\\x18\\x00P\\x00\\x00\\x00\\x00\\x00'"),
     }
     exit(0);
 }
@@ -1043,6 +729,9 @@ fn main() -> ! {
     if flag == "--help" || flag == "-h" {
         print!("{DOC}\n");
         exit(0)
+    } else if (flag == "--unwrap" || flag == "-u" || flag == "--wrap" || flag == "-w") && argv.is_empty() {
+        eprintln!("IndexError: list index out of range");
+        exit(1)
     } else if flag == "--unwrap" || flag == "-u" {
         run_unwrap(&argv)
     } else if flag == "--wrap" || flag == "-w" {

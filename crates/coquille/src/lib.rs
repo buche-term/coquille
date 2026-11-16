@@ -16,9 +16,11 @@ mod look;
 mod message;
 mod process;
 mod prompt;
+pub mod protocol;
 mod requests;
 mod shell;
 mod trust;
 pub mod util;
+pub mod words;
 
 pub use shell::Shell;

@@ -25,24 +25,32 @@ pub fn wait_fd(fd: RawFd, events: libc::c_short) {
     unsafe { libc::poll(&mut pfd, 1, -1) };
 }
 
-/// Write one line on a file descriptor (which may be non-blocking): `line`,
-/// without its trailing newlines, then one. A write that fails (but for
-/// EAGAIN or EINTR) drops what is left.
-pub fn write_line(fd: RawFd, line: &str) {
-    let mut data = line.trim_end_matches('\n').as_bytes().to_vec();
-    data.push(b'\n');
+/// Write all of `data` on a file descriptor (which may be non-blocking). A
+/// write that fails (but for EAGAIN or EINTR) drops what is left.
+pub fn write_all(fd: RawFd, data: &[u8]) {
     let mut written = 0;
     while written < data.len() {
         let n = unsafe { libc::write(fd, data[written..].as_ptr().cast(), data.len() - written) };
-        if n >= 0 {
+        if n > 0 {
             written += n as usize;
             continue;
+        }
+        if n == 0 {
+            return;
         }
         match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::EAGAIN) | Some(libc::EINTR) => wait_fd(fd, libc::POLLOUT),
             _ => return,
         }
     }
+}
+
+/// Write one line on a file descriptor (see write_all): `line`, without its
+/// trailing newlines, then one.
+pub fn write_line(fd: RawFd, line: &str) {
+    let mut data = line.trim_end_matches('\n').as_bytes().to_vec();
+    data.push(b'\n');
+    write_all(fd, &data);
 }
 
 /// Hand each JSON line of `input` to `handle`, in order, until its end, or

@@ -30,7 +30,8 @@ use crate::channel::json_lines;
 use crate::fdio::{FdStream, Writer, dup_cloexec, pipe, set_cloexec, spawn_writer};
 use crate::history::history_file;
 use crate::library::{LIB_SALT_ENV, LibraryFiles, forward_library, new_salt, verify_library};
-use crate::message::{Message, kind, make_error};
+use crate::message::{Message, kind};
+use crate::protocol::{self, process_addr, view_addr};
 use crate::util::{Utf8Decoder, address_of, merged, qualify, resolve};
 
 /// A redirection of one of the child's fds (0 to 5).
@@ -120,21 +121,25 @@ impl Shared {
         }
     }
 
-    fn address(&self, view: &str) -> Value {
-        json!(["$proc", "cq", self.process_id, view])
+    fn address(&self, view: &str) -> Vec<String> {
+        view_addr(&self.process_id, view)
     }
 
     /// Send `message` to one of the process's views (`$stdout` or `$frame`),
     /// declaring it first if need be.
     fn send_to(&self, view: &'static str, view_kind: &str, message: Value) {
         if self.declared.borrow_mut().insert(view) {
-            let look = if view == "$stdout" { self.stdout_look.borrow().clone() } else { json!({}) };
+            let look = if view == "$stdout" {
+                self.stdout_look.borrow().clone()
+            } else {
+                json!({})
+            };
             self.emit(merged(
-                json!({ "type": "configure", "from": self.address(view), "to": ["$term"], "kind": view_kind }),
+                protocol::configure(self.address(view), json!({ "kind": view_kind })),
                 look,
             ));
         }
-        self.emit(json!({ "type": "send", "from": self.address(view), "to": ["$term"], "message": message }));
+        self.emit(protocol::send(self.address(view), message));
     }
 
     fn emit_stdout(&self, text: String) {
@@ -143,9 +148,13 @@ impl Shared {
         }
         if self.gui.get() && !self.pipe_stdout {
             let data = json!({ "$schema": "buche:text", "text": text, "stream": "stdout" });
-            self.send_to("$frame", "frame", json!({ "type": "data", "data": data }));
+            self.send_to("$frame", "frame", protocol::data(data));
         } else {
-            self.send_to("$stdout", "terminal", json!({ "type": "text", "stream": "stdout", "text": text }));
+            self.send_to(
+                "$stdout",
+                "terminal",
+                json!({ "type": "text", "stream": "stdout", "text": text }),
+            );
         }
     }
 }
@@ -245,7 +254,7 @@ struct Control {
 
 impl Control {
     fn error(&self, message: String) {
-        self.shared.emit(make_error(&anyhow::anyhow!(message)));
+        self.shared.emit(protocol::error(&anyhow::anyhow!(message)));
     }
 
     /// A message on fd 5, from the process: re-addressed under this one,
@@ -256,10 +265,12 @@ impl Control {
         // process's address (["cq", id]) is spliced in right after it, so a
         // child `from` of ["$proc", ...rest] becomes ["$proc", "cq", id,
         // ...rest] within this shell's sub-tree.
-        let prefix = ["$proc".to_owned(), "cq".to_owned(), id.clone()];
+        let prefix = process_addr(id);
         let Some(from) = address_of(message.get("from")).and_then(|f| qualify(&f, &prefix)) else {
             let from = message.get("from").cloned().unwrap_or(Value::Null);
-            return self.error(format!("Process {id}: message 'from' must start with \"$proc\" (got {from})"));
+            return self.error(format!(
+                "Process {id}: message 'from' must start with \"$proc\" (got {from})"
+            ));
         };
         let Some(obj) = message.as_object_mut() else { return };
         obj.insert("from".into(), json!(from));
@@ -268,9 +279,9 @@ impl Control {
             && let Some(delegate) = message.as_object_mut().and_then(|o| o.remove("delegate"))
         {
             let key = address_key(&from[prefix.len()..]);
-            let types: Option<Vec<String>> = delegate.as_array().and_then(|a| {
-                a.iter().map(|t| t.as_str().map(str::to_owned)).collect()
-            });
+            let types: Option<Vec<String>> = delegate
+                .as_array()
+                .and_then(|a| a.iter().map(|t| t.as_str().map(str::to_owned)).collect());
             if let Some(delegations) = &self.delegations {
                 let mut delegations = delegations.borrow_mut();
                 match (delegate, types) {
@@ -299,13 +310,15 @@ impl Control {
             // for what is about the process itself.
             Some("$shell") if !self.privileged && !OPEN_TO_ALL.contains(&kind(&message)) => {
                 let (cmd, what, why) = (&self.cmd, kind(&message), &self.refusal);
-                return self.error(format!("Process {id} ({cmd}) may not send {what:?} to the shell: {why}"));
+                return self.error(format!(
+                    "Process {id} ({cmd}) may not send {what:?} to the shell: {why}"
+                ));
             }
             _ => {}
         }
         // Default the target to the terminal when the child didn't say.
         if message.get("to").is_none() {
-            message["to"] = json!(["$term"]);
+            message["to"] = json!(protocol::TERM);
         }
         self.shared.emit(message);
     }
@@ -315,15 +328,23 @@ impl Control {
     /// own proofs, under another shell (which gave us a salt).
     async fn declare_library(&self, message: &Value, from: Value) {
         let result = async {
-            let libraries = self.libraries.as_ref().ok_or_else(|| anyhow::anyhow!("library declarations are not supported here"))?;
+            let libraries = self
+                .libraries
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("library declarations are not supported here"))?;
             let (id, files) = verify_library(message, &self.salt).await?;
             forward_library(&id, files, libraries, self.parent_salt.as_deref())
         }
         .await;
         match result {
-            Ok(declaration) => self.shared.emit(merged(declaration, json!({ "from": from, "to": ["$term"] }))),
+            Ok(declaration) => self
+                .shared
+                .emit(merged(declaration, json!({ "from": from, "to": protocol::TERM }))),
             Err(err) => {
-                let error = merged(make_error(&err), json!({ "from": from, "error_type": "library", "traceback": [] }));
+                let error = merged(
+                    protocol::error(&err),
+                    json!({ "from": from, "error_type": "library", "traceback": [] }),
+                );
                 self.shared.emit(error);
             }
         }
@@ -354,7 +375,12 @@ impl Process {
         // work. Programs like less/more/emacs open /dev/tty for both keyboard
         // input and display output; with a single PTY they all resolve to the
         // same device, so there is no split between multiple masters.
-        let winsize = nix::pty::Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        let winsize = nix::pty::Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         let pty = nix::pty::openpty(Some(&winsize), None)?;
         set_cloexec(&pty.master)?;
         set_cloexec(&pty.slave)?;
@@ -502,10 +528,16 @@ impl Process {
                 } else {
                     (format!("{cmd}: {err}\r\n"), 126)
                 };
-                shared.send_to("$stdout", "terminal", json!({ "type": "text", "stream": "stderr", "text": text }));
+                shared.send_to(
+                    "$stdout",
+                    "terminal",
+                    json!({ "type": "text", "stream": "stderr", "text": text }),
+                );
                 stdin_gone.mark();
-                let close = json!({ "type": "close", "from": ["$proc", "cq", shared.process_id], "to": ["$term"], "outcome": { "type": "error", "code": code } });
-                shared.emit(close);
+                shared.emit(protocol::close(
+                    process_addr(&shared.process_id),
+                    protocol::outcome(false, Some(code)),
+                ));
                 shared.tx.borrow_mut().take();
                 let _ = exited_tx.send(true);
                 return Ok(process);
@@ -524,7 +556,7 @@ impl Process {
         // fd 4: the data channel — JSON values for the process's GUI.
         let data_shared = shared.clone();
         let data_task = spawn_local(json_lines(FdStream::new(dataout_p)?, move |data| {
-            data_shared.send_to("$frame", "frame", json!({ "type": "data", "data": data }));
+            data_shared.send_to("$frame", "frame", protocol::data(data));
             async { true }
         }));
 
@@ -561,8 +593,8 @@ impl Process {
             let _ = stop_tx.send(());
             let _ = pty_task.await;
             let code = status.ok().and_then(|s| s.code());
-            let outcome = json!({ "type": if code == Some(0) { "success" } else { "error" }, "code": code.unwrap_or(0) });
-            shared.emit(json!({ "type": "close", "from": ["$proc", "cq", shared.process_id], "to": ["$term"], "outcome": outcome }));
+            let outcome = protocol::outcome(code == Some(0), Some(code.unwrap_or(0).into()));
+            shared.emit(protocol::close(process_addr(&shared.process_id), outcome));
             shared.tx.borrow_mut().take();
             let _ = exited_tx.send(true);
         });
@@ -582,7 +614,12 @@ impl Process {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
-        let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
     }
 
@@ -646,7 +683,10 @@ impl Process {
     /// Everything the process says, as protocol messages, until it closes
     /// (for one consumer: the first to ask).
     pub fn events(&self) -> mpsc::UnboundedReceiver<Message> {
-        self.events.borrow_mut().take().unwrap_or_else(|| mpsc::unbounded_channel().1)
+        self.events
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| mpsc::unbounded_channel().1)
     }
 
     /// Once it has ended (and said so: its `close` is out).

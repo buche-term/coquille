@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::util::{is_executable, path_dirs, resolve, sha256_hex};
+use crate::util::{find_executable, sha256_hex};
 
 /// An approved file: its full path, and its SHA-256 (hex), or None for any
 /// content.
@@ -46,14 +46,6 @@ pub struct Approval {
     pub refusal: String,
 }
 
-/// The file `cmd` runs, as execvp finds it (in `path`, from `cwd`).
-pub fn resolve_executable(cmd: &str, path: &str, cwd: &Path) -> Option<PathBuf> {
-    if cmd.contains('/') {
-        return Some(resolve(cwd, cmd));
-    }
-    path_dirs(path, cwd).map(|dir| dir.join(cmd)).find(|candidate| is_executable(candidate))
-}
-
 thread_local! {
     /// Hashes already computed, by file and state (a change of content
     /// changes the ctime, which can't be set back).
@@ -76,8 +68,12 @@ fn sha256_file(file: &Path) -> std::io::Result<String> {
 /// looked up again. (A file changed between the check and the exec runs as
 /// changed: whoever can write it can as well make it what is approved.)
 pub fn approve(cmd: &str, path: &str, cwd: &Path, commands: &[ControlCommand]) -> Approval {
-    let refuse = |refusal: String| Approval { cmd: cmd.to_owned(), privileged: false, refusal };
-    let exe = resolve_executable(cmd, path, cwd);
+    let refuse = |refusal: String| Approval {
+        cmd: cmd.to_owned(),
+        privileged: false,
+        refusal,
+    };
+    let exe = find_executable(cmd, path, cwd);
     let Some((exe, real)) = exe.and_then(|e| std::fs::canonicalize(&e).ok().map(|r| (e, r))) else {
         return refuse(format!("{cmd:?} is not a control command"));
     };
@@ -102,5 +98,9 @@ pub fn approve(cmd: &str, path: &str, cwd: &Path, commands: &[ControlCommand]) -
         }
     }
     // (Its real path: a symlink to it could be pointed elsewhere meanwhile.)
-    Approval { cmd: real.to_string_lossy().into_owned(), privileged: true, refusal: String::new() }
+    Approval {
+        cmd: real.to_string_lossy().into_owned(),
+        privileged: true,
+        refusal: String::new(),
+    }
 }

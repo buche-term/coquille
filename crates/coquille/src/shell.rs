@@ -25,16 +25,18 @@ use crate::builtins::{BuiltinEvent, builtin_events, is_builtin};
 use crate::config::{ConfigError, ResolvedConfig, load_config, parse_action};
 use crate::config_watch::{FileChange, Snapshot, changes, snapshot};
 use crate::expand::{expand_env_vars, parse_program};
-use crate::highlight::{common_prefix, shell_complete, shell_highlight, word_before};
+use crate::highlight::{common_prefix, shell_complete, shell_highlight};
 use crate::history::{Direction, HistoryEntry, ShellHistory};
 use crate::library::{LIB_SALT_ENV, LibraryFiles};
 use crate::look::{command_verb, logo, parts_text, program_look, styled_all, terminal_decorations, with_program_look};
-use crate::message::{Message, SELF, from_at, from_len, kind, make_error, not_implemented, to_head};
+use crate::message::{Message, from_at, from_len, kind, not_implemented, to_head};
 use crate::process::{Delegate, Delegations, Process, ProcessOptions, Redirect, address_key};
 use crate::prompt::{prompt_context, prompt_marker, render_prompt};
-use crate::requests::{Answer, PendingRequest, REQUESTS_HTML, pending_summary, render_requests};
+use crate::protocol::{self, SELF, process_addr, prompt_configure, view_addr};
+use crate::requests::{Answer, PendingRequest, REQUESTS_HTML, pending_summary, render_requests, requests_schemas};
 use crate::trust::{TrustedFile, trust, was_trusted};
 use crate::util::{address_of, cwd, merged, put_opt, relative, tildify, utf16_len, utf16_to_byte};
+use crate::words::word_before;
 
 /// How many runs are remembered, to be run again (see Shell::rerun).
 const MAX_RUNS: usize = 1000;
@@ -129,21 +131,19 @@ impl Origin {
             id: msg.get("id").filter(|v| !v.is_null()).cloned(),
             zone: msg.get("zone").and_then(Value::as_str).map(str::to_owned),
             // (Nothing if it has none, or not an address.)
-            anchor: address_of(msg.get("anchor")).filter(|a| !a.is_empty()).map(|a| json!(a)),
+            anchor: address_of(msg.get("anchor"))
+                .filter(|a| !a.is_empty())
+                .map(|a| json!(a)),
             focus: msg.get("focus") == Some(&Value::Bool(true)),
         }
     }
 }
 
-/// What to run (see Shell::submit): a command line, or a parsed command.
+/// What to run (see Shell::submit): a command line, and how.
 #[derive(Clone, Default)]
 struct SubmitRequest {
-    /// A command line, to parse.
+    /// The command line, to parse.
     text: Option<String>,
-    /// Or a parsed command, and its redirections and variables.
-    command: Option<(String, Vec<String>)>,
-    redirects: Vec<Redirect>,
-    env: Vec<(String, String)>,
 
     /// Whether to record `text` in the history.
     history: bool,
@@ -152,7 +152,7 @@ struct SubmitRequest {
     echo: bool,
     prompt_color: Option<String>,
 
-    /// For a parsed command: the process id reserved for it, its
+    /// For each command parsed from it: the process id reserved for it, its
     /// decoration...
     process_id: Option<String>,
     decoration: Option<Map<String, Value>>,
@@ -180,28 +180,14 @@ fn config_error(ConfigError { file, message }: ConfigError) -> Message {
         Some(file) => format!("{file}: {message}"),
         None => message,
     };
-    json!({ "type": "error", "from": SELF, "to": ["$term"], "error_type": "ConfigError", "message": message, "traceback": [] })
-}
-
-/// A prompt `configure` from this shell.
-fn prompt_configure(fields: Value) -> Message {
-    merged(json!({ "type": "configure", "kind": "prompt", "from": SELF, "to": ["$term"] }), fields)
-}
-
-fn process_addr(id: &str) -> Vec<String> {
-    vec!["$proc".into(), "cq".into(), id.into()]
+    protocol::error_of_type("ConfigError", &message)
 }
 
 /// A process's `close`.
 fn close_message(addr: &[String], success: bool, code: Option<i64>) -> Message {
-    let mut outcome = json!({ "type": if success { "success" } else { "error" } });
-    if let Some(code) = code {
-        outcome["code"] = json!(code);
-    }
-    json!({ "type": "close", "from": addr, "to": ["$term"], "outcome": outcome })
+    protocol::close(addr, protocol::outcome(success, code))
 }
 
-/// The name of a compound command, for what isn't implemented.
 fn compound_name(c: &ast::CompoundCommand) -> &'static str {
     use ast::CompoundCommand::*;
     match c {
@@ -377,7 +363,11 @@ impl Shell {
 
     /// A variable: the shell's, then the environment's.
     pub(crate) fn lookup(&self, name: &str) -> Option<String> {
-        self.vars.borrow().get(name).cloned().or_else(|| self.env.borrow().get(name).cloned())
+        self.vars
+            .borrow()
+            .get(name)
+            .cloned()
+            .or_else(|| self.env.borrow().get(name).cloned())
     }
 
     fn path_var(&self) -> String {
@@ -391,7 +381,7 @@ impl Shell {
             let shell = self.clone();
             spawn_local(async move {
                 if let Err(err) = shell.clone().handle(message, None).await {
-                    shell.emit(make_error(&err));
+                    shell.emit(protocol::error(&err));
                 }
             });
         } else if let Some(out) = &*self.out.borrow() {
@@ -405,7 +395,7 @@ impl Shell {
         let shell = self.clone();
         spawn_local(async move {
             if let Err(err) = task.await {
-                shell.emit(make_error(&err));
+                shell.emit(protocol::error(&err));
             }
             shell.active.set(shell.active.get() - 1);
             if shell.active.get() == 0 {
@@ -452,7 +442,9 @@ impl Shell {
         // protocol violation.
         let Some(to) = address_of(msg.get("to")).filter(|to| to.first().is_some_and(|h| h == "$proc")) else {
             let to = msg.get("to").cloned().unwrap_or(Value::Null);
-            return self.emit(make_error(&anyhow!("Downward message must be addressed to [\"$proc\", …] (got to: {to})")));
+            return self.emit(protocol::error(&anyhow!(
+                "Downward message must be addressed to [\"$proc\", …] (got to: {to})"
+            )));
         };
         // The logical address (the part after "$proc") is either:
         //   ["cq"]                 → this shell itself: handled here;
@@ -461,7 +453,7 @@ impl Shell {
         //                            sees itself at ["$proc", ...rest].
         if let [_, namespace, id, rest @ ..] = to.as_slice() {
             if namespace != "cq" {
-                return self.emit(make_error(&anyhow!("Unknown process namespace: {namespace:?}")));
+                return self.emit(protocol::error(&anyhow!("Unknown process namespace: {namespace:?}")));
             }
             if self.requests_view.borrow().as_ref() == Some(id) {
                 return self.answer_requests_view(&msg);
@@ -491,7 +483,7 @@ impl Shell {
         };
         if holds_input {
             if let Err(err) = self.clone().handle(msg, None).await {
-                self.emit(make_error(&err));
+                self.emit(protocol::error(&err));
             }
         } else {
             let shell = self.clone();
@@ -532,7 +524,9 @@ impl Shell {
     /// Whether process `id` left requests of this `type` about its cell at
     /// `rest` to us (see Delegations), even if it has ended since.
     fn delegated(&self, id: &str, rest: &[String], request: &str) -> bool {
-        let Some(run) = self.runs.borrow().get(id).cloned() else { return false };
+        let Some(run) = self.runs.borrow().get(id).cloned() else {
+            return false;
+        };
         let delegations = run.delegations.borrow();
         match delegations.get(&address_key(rest)) {
             Some(Delegate::All) => true,
@@ -547,7 +541,9 @@ impl Shell {
     /// it. A `text` (terminal input) for a direct child likewise goes to its
     /// stdin, not to its control channel.
     fn deliver(self: &Rc<Self>, msg: &Message, id: &str, rest: &[String]) {
-        let Some(proc) = self.processes.borrow().get(id).cloned() else { return };
+        let Some(proc) = self.processes.borrow().get(id).cloned() else {
+            return;
+        };
         // A view of the process (its placeholder, terminal or frame): ours,
         // not its child's. Its terminal input and resizes are the process's;
         // its signals mean nothing (the terminal signals the process itself
@@ -575,8 +571,10 @@ impl Shell {
     /// (see library.rs): read it again, and send it if it still has that
     /// hash.
     async fn handle_library_fetch(self: &Rc<Self>, msg: &Message) {
-        let request_id = msg.get("request_id").map_or(String::new(), |r| r.as_str().map_or_else(|| r.to_string(), str::to_owned));
-        let answer = json!({ "type": "library_content", "from": SELF, "to": ["$term"], "request_id": request_id });
+        let request_id = msg.get("request_id").map_or(String::new(), |r| {
+            r.as_str().map_or_else(|| r.to_string(), str::to_owned)
+        });
+        let answer = protocol::to_term("library_content", SELF, json!({ "request_id": request_id }));
         let hash = msg.get("hash").and_then(Value::as_str).unwrap_or_default();
         let fields = match self.libraries.read(hash).await {
             Ok(data) => json!({ "content": BASE64.encode(data), "encoding": "base64" }),
@@ -592,7 +590,9 @@ impl Shell {
     /// ...arguments]), as submitted, bound to a key, or rerun. (Not the
     /// commands of a `$(…)`, nor the daemons.)
     fn command_started(&self, process_id: &str, commands: Vec<Vec<String>>, cwd: &std::path::Path) {
-        self.notify_daemons(json!({ "type": "command_started", "process_id": process_id, "commands": commands, "cwd": cwd }));
+        self.notify_daemons(
+            json!({ "type": "command_started", "process_id": process_id, "commands": commands, "cwd": cwd }),
+        );
     }
 
     /// Tell the daemons a command (see command_started) ended, and how.
@@ -601,7 +601,7 @@ impl Shell {
     }
 
     fn notify_daemons(&self, event: Value) {
-        let message = merged(json!({ "to": ["$shell"] }), event);
+        let message = protocol::to_shell(event);
         for daemon in self.daemons.borrow().values() {
             if let Some(proc) = &*daemon.proc.borrow() {
                 proc.write_control(&message);
@@ -613,7 +613,9 @@ impl Shell {
 
     /// The prompt's text and accent, as they are now (see render_prompt).
     fn render_prompt(&self) -> (Vec<Value>, String) {
-        let look = render_prompt(&self.config.borrow().prompt, &cwd().to_string_lossy(), &|name| self.lookup(name));
+        let look = render_prompt(&self.config.borrow().prompt, &cwd().to_string_lossy(), &|name| {
+            self.lookup(name)
+        });
         (look.parts, look.color)
     }
 
@@ -630,7 +632,9 @@ impl Shell {
         }
         *self.prompt_color.borrow_mut() = Some(color.clone());
         *self.prompt_look.borrow_mut() = Some(parts);
-        self.emit(prompt_configure(json!({ "input": { "context": self.current_context() }, "color": color })));
+        self.emit(prompt_configure(
+            json!({ "input": { "context": self.current_context() }, "color": color }),
+        ));
     }
 
     /// Configure the prompt whole: its look, its bindings.
@@ -638,9 +642,16 @@ impl Shell {
         let (parts, color) = self.render_prompt();
         *self.prompt_color.borrow_mut() = Some(color.clone());
         *self.prompt_look.borrow_mut() = Some(parts);
-        let dir = cwd().file_name().map_or("/".into(), |n| n.to_string_lossy().into_owned());
-        let bindings: Map<String, Value> =
-            self.config.borrow().bindings.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let dir = cwd()
+            .file_name()
+            .map_or("/".into(), |n| n.to_string_lossy().into_owned());
+        let bindings: Map<String, Value> = self
+            .config
+            .borrow()
+            .bindings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         // (Its ✕ signals this shell: the terminal signals ["$proc"], the
         // group above it, once nothing else under it lives.)
         self.emit(prompt_configure(json!({
@@ -770,7 +781,9 @@ impl Shell {
         if self.closing.get() || self.shutdown.get() {
             return;
         }
-        let Some(loaded) = self.config_snapshot.borrow().clone() else { return };
+        let Some(loaded) = self.config_snapshot.borrow().clone() else {
+            return;
+        };
         let current = snapshot(loaded.files.keys());
         let changed = changes(&loaded, &current);
         let unapplied = |file: &str| {
@@ -783,7 +796,10 @@ impl Shell {
                 for FileChange { file, .. } in &changed {
                     untrusted.retain(|u| &u.file != file);
                     if let Some(Some(hash)) = current.files.get(file) {
-                        untrusted.push(TrustedFile { file: file.clone(), hash: hash.clone() });
+                        untrusted.push(TrustedFile {
+                            file: file.clone(),
+                            hash: hash.clone(),
+                        });
                     }
                 }
             }
@@ -794,7 +810,9 @@ impl Shell {
             self.withdraw_config_request();
         } else {
             let asked = self.config_request.borrow().as_ref().map(|(v, _)| v.clone());
-            if asked.as_ref() != Some(&current.version) && self.ignored_version.borrow().as_ref() != Some(&current.version) {
+            if asked.as_ref() != Some(&current.version)
+                && self.ignored_version.borrow().as_ref() != Some(&current.version)
+            {
                 *self.config_request.borrow_mut() = Some((current.version, changed));
                 self.requests_changed();
             }
@@ -818,7 +836,10 @@ impl Shell {
                 id: format!("config:{version}"),
                 summary: "config change is pending".into(),
                 title: "The shell configuration changed. Reload it?".into(),
-                details: changes.iter().map(|c| format!("{} ({})", tildify(&c.file), c.change)).collect(),
+                details: changes
+                    .iter()
+                    .map(|c| format!("{} ({})", tildify(&c.file), c.change))
+                    .collect(),
                 approve: "Reload".into(),
                 ignore: "Ignore".into(),
             });
@@ -828,11 +849,16 @@ impl Shell {
             requests.push(PendingRequest {
                 id,
                 summary: "config needs your trust".into(),
-                title: "This directory's configuration was left out: it isn't trusted. Trust it (it can run commands)?".into(),
+                title: "This directory's configuration was left out: it isn't trusted. Trust it (it can run commands)?"
+                    .into(),
                 details: untrusted
                     .iter()
                     .map(|u| {
-                        let why = if was_trusted(&u.file) { "changed since you trusted it" } else { "never trusted" };
+                        let why = if was_trusted(&u.file) {
+                            "changed since you trusted it"
+                        } else {
+                            "never trusted"
+                        };
                         format!("{} ({why})", tildify(&u.file))
                     })
                     .collect(),
@@ -847,7 +873,13 @@ impl Shell {
     /// didn't ignore (with what they hold).
     fn visible_untrusted(&self) -> Vec<TrustedFile> {
         let ignored = self.ignored_trust.borrow();
-        self.config.borrow().untrusted.iter().filter(|u| !ignored.contains(&u.key())).cloned().collect()
+        self.config
+            .borrow()
+            .untrusted
+            .iter()
+            .filter(|u| !ignored.contains(&u.key()))
+            .cloned()
+            .collect()
     }
 
     /// The trust request's id (None: none): it names what it asks about.
@@ -876,18 +908,17 @@ impl Shell {
     fn requests_changed(self: &Rc<Self>) {
         let requests = self.pending_requests();
         if self.prompt_look.borrow().is_some() {
-            self.emit(prompt_configure(json!({ "input": { "context": self.current_context() } })));
+            self.emit(prompt_configure(
+                json!({ "input": { "context": self.current_context() } }),
+            ));
         }
-        let Some(view) = self.requests_view.borrow().clone() else { return };
+        let Some(view) = self.requests_view.borrow().clone() else {
+            return;
+        };
         if requests.is_empty() {
             return self.close_requests_view();
         }
-        self.emit(json!({
-            "type": "send",
-            "from": ["$proc", "cq", view, "$frame"],
-            "to": ["$term"],
-            "message": render_requests(&requests),
-        }));
+        self.emit(protocol::send(view_addr(&view, "$frame"), render_requests(&requests)));
     }
 
     /// The `requests` builtin (Alt+a, or a click on the pending notice in the
@@ -900,12 +931,10 @@ impl Shell {
         let id = self.generate_process_id();
         *self.requests_view.borrow_mut() = Some(id.clone());
         let addr = process_addr(&id);
-        let mut configure = json!({
-            "type": "configure",
-            "from": addr,
-            "to": ["$term"],
-            "zone": origin.zone.clone().map_or(Value::Null, Value::String),
-        });
+        let mut configure = protocol::configure(
+            &addr[..],
+            json!({ "zone": origin.zone.clone().map_or(Value::Null, Value::String) }),
+        );
         let obj = configure.as_object_mut().unwrap();
         put_opt(obj, "anchor", origin.anchor.clone());
         put_opt(obj, "id", origin.id.clone());
@@ -914,16 +943,18 @@ impl Shell {
         obj.insert("icon".into(), logo());
         put_opt(obj, "color", self.prompt_color.borrow().clone());
         self.emit(configure);
-        let mut frame = addr;
-        frame.push("$frame".into());
-        self.emit(json!({ "type": "configure", "from": frame, "to": ["$term"], "kind": "frame" }));
-        self.emit(json!({ "type": "send", "from": frame, "to": ["$term"], "message": { "type": "html", "content": REQUESTS_HTML } }));
-        self.emit(json!({ "type": "send", "from": frame, "to": ["$term"], "message": render_requests(&self.pending_requests()) }));
+        let frame = view_addr(&id, "$frame");
+        self.emit(protocol::configure(&frame[..], json!({ "kind": "frame" })));
+        self.emit(protocol::send(&frame[..], requests_schemas()));
+        self.emit(protocol::send(&frame[..], protocol::html(REQUESTS_HTML)));
+        self.emit(protocol::send(&frame[..], render_requests(&self.pending_requests())));
     }
 
     /// Close the requests view, if it is up (it is ephemeral: it goes).
     fn close_requests_view(self: &Rc<Self>) {
-        let Some(view) = self.requests_view.borrow_mut().take() else { return };
+        let Some(view) = self.requests_view.borrow_mut().take() else {
+            return;
+        };
         self.emit(close_message(&process_addr(&view), true, Some(0)));
     }
 
@@ -943,7 +974,9 @@ impl Shell {
                     Some("ignore") => Answer::Ignore,
                     _ => return,
                 };
-                let request = data.get("request").map_or(String::new(), |r| r.as_str().map_or_else(|| r.to_string(), str::to_owned));
+                let request = data.get("request").map_or(String::new(), |r| {
+                    r.as_str().map_or_else(|| r.to_string(), str::to_owned)
+                });
                 self.answer_request(&request, answer);
             }
             _ => {}
@@ -955,7 +988,9 @@ impl Shell {
         if id.starts_with("trust:") {
             return self.answer_trust_request(id, answer);
         }
-        let Some((version, changes)) = self.config_request.borrow().clone() else { return };
+        let Some((version, changes)) = self.config_request.borrow().clone() else {
+            return;
+        };
         if id != format!("config:{version}") {
             return;
         }
@@ -965,7 +1000,12 @@ impl Shell {
         }
         // A reload only happens if the files are still in that version; if
         // they changed since, the next check asks again.
-        let files: Vec<String> = self.config_snapshot.borrow().iter().flat_map(|s| s.files.keys().cloned()).collect();
+        let files: Vec<String> = self
+            .config_snapshot
+            .borrow()
+            .iter()
+            .flat_map(|s| s.files.keys().cloned())
+            .collect();
         let current = snapshot(&files);
         if current.version != version {
             return;
@@ -977,13 +1017,18 @@ impl Shell {
             .filter(|c| self.config.borrow().trusted.contains(&c.file))
             .filter_map(|c| {
                 let hash = current.files.get(&c.file).cloned().flatten()?;
-                Some(TrustedFile { file: c.file.clone(), hash })
+                Some(TrustedFile {
+                    file: c.file.clone(),
+                    hash,
+                })
             })
             .collect();
         if !accepted.is_empty()
             && let Err(err) = trust(&accepted)
         {
-            self.emit(make_error(&anyhow!(err).context("could not record the trusted files")));
+            self.emit(protocol::error(
+                &anyhow!(err).context("could not record the trusted files"),
+            ));
         }
         self.apply_config();
         self.prompt_configure_full();
@@ -998,11 +1043,15 @@ impl Shell {
         }
         let untrusted = self.visible_untrusted();
         if answer == Answer::Ignore {
-            self.ignored_trust.borrow_mut().extend(untrusted.iter().map(TrustedFile::key));
+            self.ignored_trust
+                .borrow_mut()
+                .extend(untrusted.iter().map(TrustedFile::key));
             return self.requests_changed();
         }
         if let Err(err) = trust(&untrusted) {
-            self.emit(make_error(&anyhow!(err).context("could not record the trusted files")));
+            self.emit(protocol::error(
+                &anyhow!(err).context("could not record the trusted files"),
+            ));
         }
         self.apply_config();
         self.prompt_configure_full();
@@ -1012,7 +1061,11 @@ impl Shell {
 
     fn handle_cd(self: &Rc<Self>, path: &str, process_id: Option<&str>) -> Result<()> {
         let prev = cwd().to_string_lossy().into_owned();
-        let target = if path == "-" { self.old_pwd.borrow().clone().unwrap_or_else(|| prev.clone()) } else { path.to_owned() };
+        let target = if path == "-" {
+            self.old_pwd.borrow().clone().unwrap_or_else(|| prev.clone())
+        } else {
+            path.to_owned()
+        };
         if let Err(err) = std::env::set_current_dir(&target) {
             // A real shell reports cd failures on the command's stderr —
             // inline, in its cell — not as a protocol `error` (which the
@@ -1027,11 +1080,17 @@ impl Shell {
                 Some(libc::EACCES) => "permission denied".to_owned(),
                 _ => err.to_string(),
             };
-            let stdout = json!(["$proc", "cq", process_id, "$stdout"]);
+            let stdout = view_addr(process_id, "$stdout");
             let look = self.stdout_looks.borrow().get(process_id).cloned().unwrap_or(json!({}));
-            self.emit(merged(json!({ "type": "configure", "from": stdout, "to": ["$term"], "kind": "terminal" }), look));
+            self.emit(merged(
+                protocol::configure(&stdout[..], json!({ "kind": "terminal" })),
+                look,
+            ));
             let text = format!("cd: {reason}: {target}\n");
-            self.emit(json!({ "type": "send", "from": stdout, "to": ["$term"], "message": { "type": "text", "stream": "stderr", "text": text } }));
+            self.emit(protocol::send(
+                &stdout[..],
+                json!({ "type": "text", "stream": "stderr", "text": text }),
+            ));
             self.builtin_failure.set(true);
             return Ok(());
         }
@@ -1108,13 +1167,18 @@ impl Shell {
     /// Run daemon `name` (restarting it if it says so) while it is enabled,
     /// as a task: a failure (it can't be started, say) is reported.
     fn run_daemon(self: &Rc<Self>, name: &str) {
-        let Some(daemon) = self.daemons.borrow().get(name).cloned() else { return };
+        let Some(daemon) = self.daemons.borrow().get(name).cloned() else {
+            return;
+        };
         let (shell, name) = (self.clone(), name.to_owned());
         spawn_local(async move {
             if let Err(err) = shell.run_daemon_unchecked(&daemon).await {
                 daemon.enabled.set(false);
                 daemon.proc.borrow_mut().take();
-                shell.emit(config_error(ConfigError { file: None, message: format!("daemon {name:?} failed: {err:#}") }));
+                shell.emit(config_error(ConfigError {
+                    file: None,
+                    message: format!("daemon {name:?} failed: {err:#}"),
+                }));
             }
         });
     }
@@ -1169,7 +1233,9 @@ impl Shell {
             content["filigrane"] = json!(filigrane);
         }
         let request_id = msg.get("request_id").cloned().unwrap_or(Value::Null);
-        self.emit(prompt_configure(json!({ "request_id": request_id, "input": { "content": content } })));
+        self.emit(prompt_configure(
+            json!({ "request_id": request_id, "input": { "content": content } }),
+        ));
     }
 
     /// Resize of one of our cells, e.g. from the terminal after a user drag:
@@ -1177,7 +1243,9 @@ impl Shell {
     /// The PTY resize is what raises SIGWINCH in the child.
     fn handle_resize(&self, msg: &Message) {
         let Some(to) = address_of(msg.get("to")) else { return };
-        let Some(proc) = to.get(2).and_then(|id| self.processes.borrow().get(id).cloned()) else { return };
+        let Some(proc) = to.get(2).and_then(|id| self.processes.borrow().get(id).cloned()) else {
+            return;
+        };
         if let Some(pty) = msg.get("pty") {
             let dim = |name| pty.get(name).and_then(Value::as_u64).map(|n| n as u16);
             if let Some(width) = dim("width") {
@@ -1238,13 +1306,15 @@ impl Shell {
             let text = parts_text(parts);
             relayed["input"]["content"]["parts"] = json!(shell_highlight(&text, &self.path_var()));
         }
-        self.emit(merged(relayed, json!({ "type": "configure", "kind": "prompt", "from": SELF, "to": ["$term"] })));
+        self.emit(merged(relayed, prompt_configure(Value::Null)));
     }
 
     // The prompt's commands
 
     async fn handle_command(self: &Rc<Self>, msg: &Message) -> Result<()> {
-        self.env.borrow_mut().insert("CQ_CURRENT_COMMAND".into(), msg.to_string());
+        self.env
+            .borrow_mut()
+            .insert("CQ_CURRENT_COMMAND".into(), msg.to_string());
         let raw = msg.get("action").unwrap_or(&Value::Null);
         let action = parse_action(raw).map_err(|e| anyhow!("Bad action {raw}: {e}"))?;
         let origin = Origin::from_message(msg);
@@ -1253,7 +1323,10 @@ impl Shell {
             return match builtin {
                 "submit" => self.command_submit(msg, &origin).await,
                 "run" => {
-                    let request = SubmitRequest { history: false, ..SubmitRequest::from_message(msg) };
+                    let request = SubmitRequest {
+                        history: false,
+                        ..SubmitRequest::from_message(msg)
+                    };
                     self.submit(request, &origin).await
                 }
                 "previous" => Ok(self.history_step(msg, Direction::Prev)),
@@ -1306,8 +1379,16 @@ impl Shell {
         let text = {
             let mut nav = self.nav.borrow_mut();
             let typed = msg.get("text").and_then(Value::as_str).unwrap_or_default();
-            let nav = nav.get_or_insert_with(|| NavState { anchor_id: None, filter: typed.into(), draft: typed.into() });
-            match self.history.borrow().navigate(direction, nav.anchor_id.as_deref(), &nav.filter) {
+            let nav = nav.get_or_insert_with(|| NavState {
+                anchor_id: None,
+                filter: typed.into(),
+                draft: typed.into(),
+            });
+            match self
+                .history
+                .borrow()
+                .navigate(direction, nav.anchor_id.as_deref(), &nav.filter)
+            {
                 Some((text, id)) => {
                     nav.anchor_id = Some(id);
                     text
@@ -1338,7 +1419,11 @@ impl Shell {
         // propagate: false — the processes still draining live *under* the
         // prompt in the address tree ($proc.cq.<id>); a plain close would
         // mark them all done along with the prompt.
-        self.emit(json!({ "type": "close", "from": SELF, "to": ["$term"], "outcome": { "type": "success" }, "propagate": false }));
+        self.emit(protocol::to_term(
+            "close",
+            SELF,
+            json!({ "outcome": protocol::outcome(true, None), "propagate": false }),
+        ));
         for daemon in self.daemons.borrow().values() {
             daemon.stop();
         }
@@ -1399,97 +1484,76 @@ impl Shell {
 
     /// The heart of a submission: history, parsing and running. Reached
     /// through command_submit (the terminal's Enter binding), `cq -c`, the
-    /// `run` command and key bindings, and for each parsed command.
+    /// `run` command and key bindings (the commands it parses run through
+    /// run_pipeline).
     async fn submit(self: &Rc<Self>, req: SubmitRequest, origin: &Origin) -> Result<()> {
-        if let Some(text) = &req.text {
-            // An empty (or whitespace-only) submission is a no-op: no
-            // history entry, no echo, no process.
-            if text.trim().is_empty() {
-                return Ok(());
-            }
-            if req.history {
-                let entry = HistoryEntry {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    text: text.clone(),
-                    dir: Some(cwd().to_string_lossy().into_owned()),
-                };
-                self.history.borrow_mut().push(entry);
-            }
-            // An `@zone` prefix says where it shows. Any name is a valid zone
-            // — the terminal decides what to do with it.
-            let (zoned, text) = match ZONE_PREFIX.captures(text) {
-                Some(m) => {
-                    let zoned = Origin { zone: Some(m[1].to_owned()), ..origin.clone() };
-                    (Some(zoned), text[m[0].len()..].to_owned())
-                }
-                None => (None, text.clone()),
-            };
-            if text.trim_start().starts_with('#') {
-                return Ok(());
-            }
-            return Box::pin(self.submit_text(req, text, zoned.as_ref().unwrap_or(origin))).await;
-        }
-
-        let Some((cmd, args)) = req.command.clone() else { bail!("nothing to run") };
-        // The process id reserved by submit_text (and shared with the
-        // decoration), if any.
-        let process_id = req.process_id.clone().unwrap_or_else(|| self.generate_process_id());
-        let addr = process_addr(&process_id);
-
-        // The terminal shows the process (a placeholder, until its output
-        // comes: it takes input meanwhile) where `zone` says, decorated with
-        // the command.
-        let declare = self.declare(&addr, &req, origin);
-        if is_builtin(&cmd) {
-            self.emit(declare);
-            let (message, look) = terminal_decorations(&addr, req.decoration.as_ref());
-            if let Some(message) = message {
-                self.emit(message);
-            }
-            self.stdout_looks.borrow_mut().insert(process_id.clone(), look);
-            let mut command = vec![cmd.clone()];
-            command.extend(args.iter().cloned());
-            self.command_started(&process_id, vec![command], &cwd());
-            self.builtin_failure.set(false);
-            let mut success = true;
-            if let Err(err) = self.run_builtin(&cmd, &args, &process_id) {
-                self.emit(make_error(&err));
-                success = false;
-            }
-            // An inline-reported failure (cd into nowhere): the message
-            // already went to the cell's stderr; only the exit code is left.
-            if self.builtin_failure.get() {
-                success = false;
-            }
-            let close = close_message(&addr, success, Some(if success { 0 } else { 1 }));
-            self.emit(close.clone());
-            self.command_ended(&process_id, &close["outcome"]);
+        let Some(text) = &req.text else { bail!("nothing to run") };
+        // An empty (or whitespace-only) submission is a no-op: no history
+        // entry, no echo, no process.
+        if text.trim().is_empty() {
             return Ok(());
         }
+        if req.history {
+            let entry = HistoryEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                text: text.clone(),
+                dir: Some(cwd().to_string_lossy().into_owned()),
+            };
+            self.history.borrow_mut().push(entry);
+        }
+        // An `@zone` prefix says where it shows. Any name is a valid zone —
+        // the terminal decides what to do with it.
+        let (zoned, text) = match ZONE_PREFIX.captures(text) {
+            Some(m) => {
+                let zoned = Origin {
+                    zone: Some(m[1].to_owned()),
+                    ..origin.clone()
+                };
+                (Some(zoned), text[m[0].len()..].to_owned())
+            }
+            None => (None, text.clone()),
+        };
+        if text.trim_start().starts_with('#') {
+            return Ok(());
+        }
+        Box::pin(self.submit_text(req, text, zoned.as_ref().unwrap_or(origin))).await
+    }
 
-        let stage = Stage { cmd, args, redirects: req.redirects.clone(), env: req.env.clone() };
-        let run = self.new_run(vec![stage], req.decoration.as_ref());
-        let proc = self.spawn_run(&process_id, &run)?;
-        self.remember(&process_id, run.clone());
-        self.emit(declare);
+    /// Run builtin `cmd` as a process of its own (see run_pipeline: a cell
+    /// shows it, as any command's).
+    fn run_builtin_cell(self: &Rc<Self>, cmd: &str, args: &[String], req: &SubmitRequest, origin: &Origin) {
+        let process_id = req.process_id.clone().unwrap_or_else(|| self.generate_process_id());
+        let addr = process_addr(&process_id);
+        self.emit(self.declare(&addr, req, origin));
         let (message, look) = terminal_decorations(&addr, req.decoration.as_ref());
         if let Some(message) = message {
             self.emit(message);
         }
-        proc.set_stdout_look(look.clone());
-        *run.stdout_look.borrow_mut() = look;
-        self.relay_run(proc, run).await;
-        Ok(())
+        self.stdout_looks.borrow_mut().insert(process_id.clone(), look);
+        let command = std::iter::once(cmd.to_owned()).chain(args.iter().cloned()).collect();
+        self.command_started(&process_id, vec![command], &cwd());
+        self.builtin_failure.set(false);
+        let mut success = true;
+        if let Err(err) = self.run_builtin(cmd, args, &process_id) {
+            self.emit(protocol::error(&err));
+            success = false;
+        }
+        // An inline-reported failure (cd into nowhere): the message
+        // already went to the cell's stderr; only the exit code is left.
+        if self.builtin_failure.get() {
+            success = false;
+        }
+        let close = close_message(&addr, success, Some(if success { 0 } else { 1 }));
+        self.emit(close.clone());
+        self.command_ended(&process_id, &close["outcome"]);
     }
 
     /// The `configure` declaring a process's entry.
     fn declare(&self, addr: &[String], req: &SubmitRequest, origin: &Origin) -> Message {
-        let mut declare = json!({
-            "type": "configure",
-            "from": addr,
-            "to": ["$term"],
-            "zone": origin.zone.clone().map_or(Value::Null, Value::String),
-        });
+        let mut declare = protocol::configure(
+            addr,
+            json!({ "zone": origin.zone.clone().map_or(Value::Null, Value::String) }),
+        );
         let obj = declare.as_object_mut().unwrap();
         put_opt(obj, "anchor", origin.anchor.clone());
         if origin.focus {
@@ -1518,7 +1582,12 @@ impl Shell {
             BuiltinEvent::Cd { path } => self.handle_cd(&path, process_id)?,
             BuiltinEvent::Set { name, value, export } => self.handle_set(&name, &value, export),
             BuiltinEvent::Nuke => self.kill_all(),
-            BuiltinEvent::DaemonSet { name, cmd, args, restart_ms } => self.daemon_set(&name, &cmd, args, restart_ms),
+            BuiltinEvent::DaemonSet {
+                name,
+                cmd,
+                args,
+                restart_ms,
+            } => self.daemon_set(&name, &cmd, args, restart_ms),
             BuiltinEvent::DaemonEnable { name } => self.daemon_enable(&name),
             BuiltinEvent::DaemonDisable { name } => self.daemon_disable(&name),
         }
@@ -1534,7 +1603,10 @@ impl Shell {
             cwd: cwd(),
             env: self.env.borrow().clone(),
             stdout_look: RefCell::new(json!({})),
-            color: decoration.and_then(|d| d.get("color")).and_then(Value::as_str).map(str::to_owned),
+            color: decoration
+                .and_then(|d| d.get("color"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             delegations: Rc::default(),
             procs: RefCell::default(),
         })
@@ -1567,10 +1639,16 @@ impl Shell {
                 // own output is sent from ["$proc", "cq", <id>, "$stdout" |
                 // "$frame"] (4 long) and its own close from ["$proc", "cq",
                 // <id>] (3 long).
-                let view = if from_len(&event) == Some(4) { from_at(&event, 3) } else { None };
+                let view = if from_len(&event) == Some(4) {
+                    from_at(&event, 3)
+                } else {
+                    None
+                };
                 let message = event.get("message");
                 let message_kind = message.and_then(|m| m.get("type")).and_then(Value::as_str);
-                if kind(&event) == "send" && view == Some("$stdout") && message_kind == Some("text")
+                if kind(&event) == "send"
+                    && view == Some("$stdout")
+                    && message_kind == Some("text")
                     && message.and_then(|m| m.get("stream")) == Some(&json!("stdout"))
                 {
                     dst.write_stdin(message.and_then(|m| m["text"].as_str()).unwrap_or_default());
@@ -1584,36 +1662,40 @@ impl Shell {
         });
     }
 
-    /// Start a run's processes, a pipeline's each feeding the next, the last
-    /// one as process `process_id`: the one whose cells show the run, to
-    /// relay (see relay_run). Nothing is left running if one can't be
-    /// started.
-    fn spawn_run(self: &Rc<Self>, process_id: &str, run: &Rc<Run>) -> Result<Rc<Process>> {
-        let last = run.stages.len() - 1;
+    /// Start `stages` with `env`, in `cwd`, each feeding the next (see
+    /// connect), the last one as process `last_id`, its options (and command)
+    /// adjusted by `last`. Nothing is left running if one can't be started.
+    fn spawn_stages(
+        self: &Rc<Self>,
+        stages: &[Stage],
+        env: &BTreeMap<String, String>,
+        cwd: &std::path::Path,
+        last_id: &str,
+        last: impl FnOnce(&Stage, &BTreeMap<String, String>, &mut ProcessOptions) -> String,
+    ) -> Result<Vec<Rc<Process>>> {
+        let n = stages.len();
+        let mut last = Some(last);
         let mut procs: Vec<Rc<Process>> = vec![];
-        for (i, stage) in run.stages.iter().enumerate() {
-            let id = if i == last { process_id.to_owned() } else { self.generate_process_id() };
-            let mut env = run.env.clone();
+        for (i, stage) in stages.iter().enumerate() {
+            let id = if i == n - 1 {
+                last_id.to_owned()
+            } else {
+                self.generate_process_id()
+            };
+            let mut env = env.clone();
             env.extend(stage.env.iter().cloned());
-            let mut options = self.process_options(env.clone(), run.cwd.clone());
-            let mut cmd = stage.cmd.clone();
-            // Whether it may address the shell (see approval.rs): checked
-            // anew at each run. (Only the last one's messages are heeded.)
-            if i == last {
-                let path = env.get("PATH").cloned().unwrap_or_default();
-                let approval = approve(&stage.cmd, &path, &run.cwd, &self.config.borrow().control_commands);
-                cmd = approval.cmd;
-                options.privileged = approval.privileged;
-                options.refusal = approval.refusal;
-                options.delegations = Some(run.delegations.clone());
-            }
+            let mut options = self.process_options(env.clone(), cwd.to_owned());
             // Non-first processes read stdin from a pipe (the previous one's
             // stdout, not the PTY). Non-last processes write stdout to a
             // pipe, so programs don't see a terminal and behave as they would
             // in a real shell pipeline (e.g. ls outputs one file per line).
             options.pipe_stdin = i > 0;
-            options.pipe_stdout = i < last;
+            options.pipe_stdout = i < n - 1;
             options.redirects = stage.redirects.clone();
+            let cmd = match last.take_if(|_| i == n - 1) {
+                Some(last) => last(stage, &env, &mut options),
+                None => stage.cmd.clone(),
+            };
             match Process::spawn(&cmd, &stage.args, id.clone(), options) {
                 Ok(proc) => {
                     self.processes.borrow_mut().insert(id, proc.clone());
@@ -1631,17 +1713,42 @@ impl Shell {
         for pair in procs.windows(2) {
             self.connect(pair[0].clone(), pair[1].clone());
         }
+        Ok(procs)
+    }
+
+    /// Start a run's processes (see spawn_stages), the last one as process
+    /// `process_id`: the one whose cells show the run, to relay (see
+    /// relay_run).
+    fn spawn_run(self: &Rc<Self>, process_id: &str, run: &Rc<Run>) -> Result<Rc<Process>> {
+        let control_commands = self.config.borrow().control_commands.clone();
+        let procs = self.spawn_stages(&run.stages, &run.env, &run.cwd, process_id, |stage, env, options| {
+            // Whether it may address the shell (see approval.rs): checked
+            // anew at each run. (Only the last one's messages are heeded.)
+            let path = env.get("PATH").cloned().unwrap_or_default();
+            let approval = approve(&stage.cmd, &path, &run.cwd, &control_commands);
+            options.privileged = approval.privileged;
+            options.refusal = approval.refusal;
+            options.delegations = Some(run.delegations.clone());
+            approval.cmd
+        })?;
         *run.procs.borrow_mut() = procs.clone();
-        let commands = run.stages.iter().map(|s| std::iter::once(s.cmd.clone()).chain(s.args.iter().cloned()).collect()).collect();
+        let commands = run
+            .stages
+            .iter()
+            .map(|s| std::iter::once(s.cmd.clone()).chain(s.args.iter().cloned()).collect())
+            .collect();
         self.command_started(process_id, commands, &run.cwd);
         let (run_ref, ended) = (run.clone(), procs.clone());
         spawn_local(async move {
             for proc in &ended {
                 proc.exited().await;
             }
-            run_ref.procs.borrow_mut().retain(|p| !ended.iter().any(|e| Rc::ptr_eq(p, e)));
+            run_ref
+                .procs
+                .borrow_mut()
+                .retain(|p| !ended.iter().any(|e| Rc::ptr_eq(p, e)));
         });
-        Ok(procs[last].clone())
+        Ok(procs.last().unwrap().clone())
     }
 
     /// Relay what a run's process says, until it ends. Its messages go
@@ -1672,7 +1779,9 @@ impl Shell {
     /// remembered (a builtin, say, or one of more than MAX_RUNS ago), one
     /// already being rerun, or while the shell is closing.
     async fn rerun(self: &Rc<Self>, process_id: String) -> Result<()> {
-        let Some(run) = self.runs.borrow().get(&process_id).cloned() else { return Ok(()) };
+        let Some(run) = self.runs.borrow().get(&process_id).cloned() else {
+            return Ok(());
+        };
         if self.rerunning.borrow().contains(&process_id) || self.closing.get() || self.shutdown.get() {
             return Ok(());
         }
@@ -1691,9 +1800,9 @@ impl Shell {
             if self.closing.get() || self.shutdown.get() {
                 return Ok(None);
             }
-            self.emit(json!({ "type": "reset", "from": addr, "to": ["$term"] }));
+            self.emit(protocol::reset(&addr[..]));
             // (A cell closed or killed meanwhile is unresponsive: it runs again.)
-            self.emit(json!({ "type": "configure", "from": addr, "to": ["$term"], "status": "running" }));
+            self.emit(protocol::configure(&addr[..], json!({ "status": "running" })));
             match self.spawn_run(&process_id, &run) {
                 Ok(proc) => {
                     proc.set_stdout_look(run.stdout_look.borrow().clone());
@@ -1745,14 +1854,21 @@ impl Shell {
             decoration
         });
 
-        let opts = SubmitRequest { history: false, echo: req.echo, ..Default::default() };
+        let opts = SubmitRequest {
+            history: false,
+            echo: req.echo,
+            ..Default::default()
+        };
         let program = match program {
             Ok(program) => program,
             Err(err) => {
                 // Show the command anyway: an entry that only exists to carry
                 // the parse error (its placeholder shows it).
                 let addr = process_addr(&process_id);
-                let failed = SubmitRequest { decoration: decoration.clone(), ..opts };
+                let failed = SubmitRequest {
+                    decoration: decoration.clone(),
+                    ..opts
+                };
                 let mut declare = self.declare(&addr, &failed, origin);
                 declare.as_object_mut().unwrap().remove("background");
                 self.emit(declare);
@@ -1766,7 +1882,10 @@ impl Shell {
 
         let mut first = true;
         // (What later commands show doesn't take the focus.)
-        let later = Origin { focus: false, ..origin.clone() };
+        let later = Origin {
+            focus: false,
+            ..origin.clone()
+        };
         for item in program.complete_commands.iter().flat_map(|c| &c.0) {
             // Only the first command carries the decoration and the reserved
             // id; later `;`-separated commands generate their own.
@@ -1779,10 +1898,7 @@ impl Shell {
             let origin = if first { origin } else { &later };
             first = false;
             let pipeline = single_pipeline(&item.0, "")?;
-            match pipeline.seq.as_slice() {
-                [command] => self.run_command(simple(command)?, opts, origin).await?,
-                commands => self.run_pipeline(commands, opts, origin).await?,
-            }
+            self.run_pipeline(&pipeline.seq, opts, origin).await?;
         }
         Ok(())
     }
@@ -1790,7 +1906,11 @@ impl Shell {
     /// Expand a simple command's words, redirections and assignments.
     async fn expand_simple(self: &Rc<Self>, command: &ast::SimpleCommand) -> Result<Expanded> {
         use ast::CommandPrefixOrSuffixItem as Item;
-        let mut expanded = Expanded { words: vec![], redirects: vec![], env: vec![] };
+        let mut expanded = Expanded {
+            words: vec![],
+            redirects: vec![],
+            env: vec![],
+        };
         for item in command.prefix.iter().flat_map(|p| &p.0) {
             match item {
                 Item::AssignmentWord(assignment, _) => expanded.env.push(self.expand_assignment(assignment).await?),
@@ -1833,53 +1953,48 @@ impl Shell {
         Ok((name.clone(), value))
     }
 
-    async fn run_command(
-        self: &Rc<Self>,
-        command: &ast::SimpleCommand,
-        opts: SubmitRequest,
-        origin: &Origin,
-    ) -> Result<()> {
-        let expanded = self.expand_simple(command).await?;
-        if command.word_or_name.is_none() && expanded.words.is_empty() {
-            // Assignments alone: shell variables.
-            for (name, value) in expanded.env {
-                let set = SubmitRequest {
-                    command: Some(("set".into(), vec![format!("{name}={value}")])),
-                    ..Default::default()
-                };
-                Box::pin(self.submit(set, origin)).await?;
-            }
-            return Ok(());
-        }
-        let mut words = expanded.words.into_iter();
-        // Everything expanded away: no command to run, no cell to show.
-        let Some(cmd) = words.next() else { return Ok(()) };
-        let req = SubmitRequest {
-            command: Some((cmd, words.collect())),
-            redirects: expanded.redirects,
-            env: expanded.env,
-            ..opts
-        };
-        Box::pin(self.submit(req, origin)).await
-    }
-
+    /// Run a pipeline (a lone command being one of a single stage): the
+    /// stages' words expand before any of them starts, as bash expands a
+    /// whole pipeline up front. A lone command may also be assignments alone
+    /// (shell variables), or a builtin.
     async fn run_pipeline(
         self: &Rc<Self>,
         commands: &[ast::Command],
         opts: SubmitRequest,
         origin: &Origin,
     ) -> Result<()> {
-        // The stages' words expand before any of them starts, as bash expands
-        // a whole pipeline up front.
+        let lone = commands.len() == 1;
         let mut stages = vec![];
         for command in commands {
-            let expanded = self.expand_simple(simple(command)?).await?;
-            let mut words = expanded.words.into_iter();
-            let Some(cmd) = words.next() else { bail!("An empty expansion cannot be a pipeline stage") };
-            if is_builtin(&cmd) {
-                return Err(not_implemented("builtins in pipes"));
+            let command = simple(command)?;
+            let expanded = self.expand_simple(command).await?;
+            if lone && command.word_or_name.is_none() && expanded.words.is_empty() {
+                for (name, value) in expanded.env {
+                    self.run_builtin_cell("set", &[format!("{name}={value}")], &SubmitRequest::default(), origin);
+                }
+                return Ok(());
             }
-            stages.push(Stage { cmd, args: words.collect(), redirects: expanded.redirects, env: expanded.env });
+            let mut words = expanded.words.into_iter();
+            let Some(cmd) = words.next() else {
+                // Everything expanded away: no command to run, no cell to show.
+                if lone {
+                    return Ok(());
+                }
+                bail!("An empty expansion cannot be a pipeline stage")
+            };
+            if is_builtin(&cmd) {
+                if !lone {
+                    return Err(not_implemented("builtins in pipes"));
+                }
+                self.run_builtin_cell(&cmd, &words.collect::<Vec<_>>(), &opts, origin);
+                return Ok(());
+            }
+            stages.push(Stage {
+                cmd,
+                args: words.collect(),
+                redirects: expanded.redirects,
+                env: expanded.env,
+            });
         }
 
         // The cell for the whole pipeline is attributed to the last process,
@@ -1889,6 +2004,9 @@ impl Shell {
         let last = self.spawn_run(&process_id, &run)?;
         self.remember(&process_id, run.clone());
 
+        // The terminal shows the process (a placeholder, until its output
+        // comes: it takes input meanwhile) where `zone` says, decorated with
+        // the command.
         let addr = process_addr(&process_id);
         self.emit(self.declare(&addr, &opts, origin));
         let (message, look) = terminal_decorations(&addr, opts.decoration.as_ref());
@@ -1948,34 +2066,20 @@ impl Shell {
             if is_builtin(&cmd) {
                 return Err(not_implemented(format!("the builtin {cmd:?} in $(…)")));
             }
-            stages.push(Stage { cmd, args: words.collect(), redirects: expanded.redirects, env: expanded.env });
+            stages.push(Stage {
+                cmd,
+                args: words.collect(),
+                redirects: expanded.redirects,
+                env: expanded.env,
+            });
         }
-        let mut procs: Vec<Rc<Process>> = vec![];
-        for (i, stage) in stages.iter().enumerate() {
-            let mut env = self.env.borrow().clone();
-            env.extend(stage.env.iter().cloned());
-            let mut options = self.process_options(env, cwd());
-            options.pipe_stdin = i > 0;
+        let env = self.env.borrow().clone();
+        let id = self.generate_process_id();
+        let procs = self.spawn_stages(&stages, &env, &cwd(), &id, |stage, _, options| {
             options.pipe_stdout = true; // the last one's stdout comes to us: piped too
-            options.redirects = stage.redirects.clone();
-            let id = self.generate_process_id();
-            let proc = match Process::spawn(&stage.cmd, &stage.args, id.clone(), options) {
-                Ok(proc) => proc,
-                Err(err) => {
-                    for proc in &procs {
-                        proc.kill(None);
-                        self.untrack(&proc.process_id, Some(proc));
-                    }
-                    return Err(err);
-                }
-            };
-            self.processes.borrow_mut().insert(id, proc.clone());
-            procs.push(proc);
-        }
+            stage.cmd.clone()
+        })?;
         let last = procs.last().unwrap().clone();
-        for pair in procs.windows(2) {
-            self.connect(pair[0].clone(), pair[1].clone());
-        }
         let out = capture_stdout(&last).await;
         self.untrack(&last.process_id, Some(&last));
         Ok(out)

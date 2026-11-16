@@ -8,6 +8,8 @@ use clap::Parser;
 use coquille::Shell;
 use coquille::channel::{control_fd_var, json_lines};
 use coquille::fdio::{FdStream, dup_cloexec};
+use coquille::protocol::SELF;
+use coquille::util::terminal_size;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -26,16 +28,6 @@ struct Cli {
     /// Output to stdout instead of the control file descriptor (fd 5)
     #[arg(long)]
     stdout: bool,
-}
-
-/// The size of the terminal the commands get: buche's, or stdout's.
-fn terminal_size() -> (u16, u16) {
-    let env = |name| std::env::var(name).ok().and_then(|v| v.parse().ok());
-    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-    let tty = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
-    let cols = env("BUCHE_PTY_COLS").unwrap_or(if tty && ws.ws_col > 0 { ws.ws_col } else { 230 });
-    let rows = env("BUCHE_PTY_ROWS").unwrap_or(if tty && ws.ws_row > 0 { ws.ws_row } else { 24 });
-    (cols, rows)
 }
 
 /// Read JSON lines from `input` into `tx` (lines that aren't JSON are
@@ -71,10 +63,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(text) = cli.command {
         // Submit the command the way the terminal would: a `command` message
         // for the shell itself.
-        let _ = in_tx.send(json!({ "type": "command", "action": { "builtin": "submit" }, "to": ["$proc", "cq"], "text": text }));
+        let _ = in_tx.send(json!({ "type": "command", "action": { "builtin": "submit" }, "to": SELF, "text": text }));
         drop(in_tx); // (Nothing else comes.)
     } else if let Some(play) = cli.play {
-        let file = tokio::fs::File::open(&play).await.map_err(|e| anyhow::anyhow!("{}: {e}", play.display()))?;
+        let file = tokio::fs::File::open(&play)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}: {e}", play.display()))?;
         tokio::task::spawn_local(read_messages(file, in_tx));
     } else if let Some(fd) = control_input {
         tokio::task::spawn_local(read_messages(FdStream::new(dup_cloexec(fd)?)?, in_tx));
@@ -82,7 +76,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         tokio::task::spawn_local(read_messages(tokio::io::stdin(), in_tx));
     }
 
-    let (cols, rows) = terminal_size();
+    let (cols, rows) = terminal_size(libc::STDOUT_FILENO);
     let shell = Shell::new(out_tx, cols, rows);
     shell.run(in_rx).await;
     let _ = writer.await;
@@ -91,7 +85,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
 fn main() {
     let cli = Cli::parse();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     let local = tokio::task::LocalSet::new();
     match local.block_on(&runtime, run(cli)) {
         // (Without waiting for what is still running: daemons, a stuck

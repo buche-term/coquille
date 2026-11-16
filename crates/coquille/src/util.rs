@@ -1,4 +1,5 @@
-//! Small helpers: paths, hashes, JSON objects, addresses, UTF-16 offsets.
+//! Small helpers: paths, executables, terminal sizes, hashes, JSON objects,
+//! addresses, UTF-16 offsets.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -60,7 +61,9 @@ pub fn expand_home(word: &str) -> String {
 /// (the user's), as Python's `os.path.expanduser` does it: an unknown user
 /// is left as is.
 pub fn expand_user(path: &str) -> String {
-    let Some(rest) = path.strip_prefix('~') else { return path.to_owned() };
+    let Some(rest) = path.strip_prefix('~') else {
+        return path.to_owned();
+    };
     let (user, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
     let home = if user.is_empty() { Some(home()) } else { user_home(user) };
     match home.map(|h| h.to_string_lossy().into_owned()) {
@@ -87,8 +90,7 @@ pub fn tildify(file: &str) -> String {
 pub fn is_executable(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => {
-            meta.permissions().mode() & 0o111 != 0
-                && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
+            meta.permissions().mode() & 0o111 != 0 && nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
         }
         _ => false,
     }
@@ -98,7 +100,60 @@ pub fn is_executable(path: &Path) -> bool {
 /// searches them: relative to the working directory `cwd`, an empty entry
 /// being the working directory itself.
 pub fn path_dirs<'a>(path: &'a str, cwd: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
-    path.split(':').map(move |dir| resolve(cwd, if dir.is_empty() { "." } else { dir }))
+    path.split(':')
+        .map(move |dir| resolve(cwd, if dir.is_empty() { "." } else { dir }))
+}
+
+/// The file `cmd` runs, as execvp finds it (in `path`, from `cwd`): the
+/// first executable of that name in the PATH's directories (see path_dirs),
+/// or, if it has a slash, the file it names (whatever it is).
+pub fn find_executable(cmd: &str, path: &str, cwd: &Path) -> Option<PathBuf> {
+    if cmd.contains('/') {
+        return Some(resolve(cwd, cmd));
+    }
+    path_dirs(path, cwd)
+        .map(|dir| dir.join(cmd))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// The size (columns, rows) of a terminal whose size isn't known.
+pub const DEFAULT_TERMINAL_SIZE: (u16, u16) = (80, 24);
+
+/// The size buche gives its commands' terminals ($BUCHE_PTY_COLS,
+/// $BUCHE_PTY_ROWS): columns and rows, each if set to a positive number.
+pub fn buche_terminal_size() -> (Option<u16>, Option<u16>) {
+    let var = |name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n: &u16| n > 0)
+    };
+    (var("BUCHE_PTY_COLS"), var("BUCHE_PTY_ROWS"))
+}
+
+/// The size (columns, rows) of the terminal on `fd`, if it is one (each 0
+/// if it doesn't know). Async-signal-safe.
+pub fn tty_size(fd: std::os::fd::RawFd) -> Option<(u16, u16)> {
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    (unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0).then_some((ws.ws_col, ws.ws_row))
+}
+
+/// The size (columns, rows) of the terminal commands get, dimension by
+/// dimension: buche's (see buche_terminal_size), else that of the terminal
+/// on `fd`, else DEFAULT_TERMINAL_SIZE.
+pub fn terminal_size(fd: std::os::fd::RawFd) -> (u16, u16) {
+    let (cols, rows) = buche_terminal_size();
+    let (tty_cols, tty_rows) = tty_size(fd).unwrap_or((0, 0));
+    let pick = |env: Option<u16>, tty: u16, default| env.or((tty > 0).then_some(tty)).unwrap_or(default);
+    (
+        pick(cols, tty_cols, DEFAULT_TERMINAL_SIZE.0),
+        pick(rows, tty_rows, DEFAULT_TERMINAL_SIZE.1),
+    )
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -178,7 +233,9 @@ pub fn qualify(address: &[String], prefix: &[String]) -> Option<Vec<String>> {
 /// The address `rest` under a process, relative to it (["$proc", ...rest]:
 /// as the process knows it).
 pub fn relative(rest: &[String]) -> Vec<String> {
-    std::iter::once("$proc".to_owned()).chain(rest.iter().cloned()).collect()
+    std::iter::once("$proc".to_owned())
+        .chain(rest.iter().cloned())
+        .collect()
 }
 
 /// An address under `prefix` (a process's), relative to it (see relative).
@@ -239,15 +296,24 @@ mod tests {
     #[test]
     fn path_dirs_like_posix() {
         let dirs: Vec<PathBuf> = path_dirs("/bin::sub", Path::new("/w")).collect();
-        assert_eq!(dirs, vec![PathBuf::from("/bin"), PathBuf::from("/w"), PathBuf::from("/w/sub")]);
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/bin"), PathBuf::from("/w"), PathBuf::from("/w/sub")]
+        );
     }
 
     #[test]
     fn qualifies_addresses() {
         let a = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(qualify(&a(&["$proc", "x"]), &a(&["$proc", "cq", "3"])), Some(a(&["$proc", "cq", "3", "x"])));
+        assert_eq!(
+            qualify(&a(&["$proc", "x"]), &a(&["$proc", "cq", "3"])),
+            Some(a(&["$proc", "cq", "3", "x"]))
+        );
         assert_eq!(qualify(&a(&["$term"]), &a(&["$proc", "cq", "3"])), None);
-        assert_eq!(unqualify(&a(&["$proc", "cq", "3", "x"]), &a(&["$proc", "cq", "3"])), Some(a(&["$proc", "x"])));
+        assert_eq!(
+            unqualify(&a(&["$proc", "cq", "3", "x"]), &a(&["$proc", "cq", "3"])),
+            Some(a(&["$proc", "x"]))
+        );
         assert_eq!(unqualify(&a(&["$proc", "cq", "4"]), &a(&["$proc", "cq", "3"])), None);
     }
 
