@@ -3,8 +3,10 @@
 //! may only switch its own stdout's mode (see OPEN_TO_ALL).
 //!
 //! They are listed in the global configuration (`control-commands`: see
-//! config.rs), as {path, hash}: a full path, and the SHA-256 of the file, or
-//! null to take it whatever it holds (a program of one's own, often changed).
+//! config.rs), as {path, hash}: the file's full path, or a bare name (no
+//! slash) to find in PATH each time it runs — so which file it is depends on
+//! PATH — and the SHA-256 of the file, or null to take it whatever it holds
+//! (a program of one's own, often changed).
 //! A process gets the privilege when this shell starts it from a listed file
 //! (resolved as execvp would, symlinks followed) whose content matches: the
 //! shell then runs that very file (by its real path), and the privilege is
@@ -20,12 +22,26 @@ use std::path::{Path, PathBuf};
 
 use crate::util::{find_executable, sha256_hex};
 
-/// An approved file: its full path, and its SHA-256 (hex), or None for any
+/// An approved file: its full path — or, for a bare name (no slash), a name
+/// to find in PATH each time it runs — and its SHA-256 (hex), or None for any
 /// content.
 #[derive(Clone, Debug)]
 pub struct ControlCommand {
     pub path: PathBuf,
     pub hash: Option<String>,
+}
+
+impl ControlCommand {
+    /// The file this entry names now: its path as it stands; a bare name is
+    /// looked up in `path` (PATH), from `cwd`, as running it would find it.
+    fn real(&self, path: &str, cwd: &Path) -> Option<PathBuf> {
+        let found = if self.path.is_absolute() {
+            Some(self.path.clone())
+        } else {
+            find_executable(&self.path.to_string_lossy(), path, cwd)
+        };
+        found.and_then(|f| std::fs::canonicalize(f).ok())
+    }
 }
 
 /// The messages to ["$shell"] any process may send: those about itself.
@@ -80,7 +96,7 @@ pub fn approve(cmd: &str, path: &str, cwd: &Path, commands: &[ControlCommand]) -
     let exe = exe.display();
     let entries: Vec<_> = commands
         .iter()
-        .filter(|c| std::fs::canonicalize(&c.path).ok().as_ref() == Some(&real))
+        .filter(|c| c.real(path, cwd).as_ref() == Some(&real))
         .collect();
     if entries.is_empty() {
         return refuse(format!("{exe} is not a control command (see control-commands)"));

@@ -857,11 +857,18 @@ fn apply_entry(config: &mut ResolvedConfig, entry: &ConfigEntry, problems: &mut 
                 }
                 let name = obj.get("path").and_then(Value::as_str);
                 let shown = obj.get("path").map_or("undefined".into(), Value::to_string);
-                let full = name.map(expand_home).filter(|p| p.starts_with('/'));
+                // (A full path, or a bare name with no slash: found in PATH
+                // each time it runs, so which file it is depends on PATH.)
+                let full = name.map(expand_home).filter(|p| !p.is_empty() && (p.starts_with('/') || !p.contains('/')));
                 let Some(full) = full else {
-                    problems.add(Some(file), format!("{here}.path: expected a full path, got {shown}; ignored"));
+                    problems.add(Some(file), format!(
+                        "{here}.path: expected a full path or a name to find in PATH (e.g. sel), got {shown}; ignored"
+                    ));
                     continue;
                 };
+                // (A bare name stays as it is: approval.rs looks it up when the
+                // command runs, when PATH is what it will be.)
+                let target = if full.starts_with('/') { resolve(Path::new("/"), &full) } else { PathBuf::from(&full) };
                 let name = name.unwrap_or_default();
                 match obj.get("hash") {
                     // (Taking a file whatever it holds is to be said: hash: null.)
@@ -869,10 +876,10 @@ fn apply_entry(config: &mut ResolvedConfig, entry: &ConfigEntry, problems: &mut 
                         "{here}: missing `hash` (the file's SHA-256: shasum -a 256 {name}; or null for any content); ignored"
                     )),
                     Some(Value::Null) => {
-                        config.control_commands.push(ControlCommand { path: resolve(Path::new("/"), &full), hash: None });
+                        config.control_commands.push(ControlCommand { path: target, hash: None });
                     }
                     Some(Value::String(h)) if is_hash(h) => config.control_commands.push(ControlCommand {
-                        path: resolve(Path::new("/"), &full),
+                        path: target,
                         hash: Some(h.clone()),
                     }),
                     Some(other) => problems.add(Some(file), format!(

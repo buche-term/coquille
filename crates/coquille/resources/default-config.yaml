@@ -93,7 +93,9 @@ history:
 #   The programs that may address the shell (["$shell"], on their fd 5): to
 #   submit commands, change the prompt, start daemons... Any other
 #   program may only switch its own stdout's mode (stdout_mode). A list of
-#   {path, hash}: the file's full path (~/ is your home directory), and its
+#   {path, hash}: the file's full path (~/ is your home directory), or a
+#   bare name (e.g. sel) to find in PATH each time it runs — which file it
+#   is then depends on what PATH is — and its
 #   SHA-256 (shasum -a 256 FILE, in quotes), or null to take it whatever it
 #   holds (a program of your own, that you change often): `hash` must be
 #   given. A process gets the privilege when this shell runs
@@ -104,6 +106,7 @@ history:
 #   (~/.config/cq/config.yaml). E.g.
 #
 #     control-commands:
+#       - {path: sel, hash: null}
 #       - {path: ~/bin/sel, hash: null}
 #       - path: /usr/local/bin/picker
 #         hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
