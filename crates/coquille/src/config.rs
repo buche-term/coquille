@@ -145,7 +145,9 @@ pub struct ResolvedConfig {
     pub prompt: PromptSpec,
     /// How many commands the history keeps (see `history.size`).
     pub history_size: usize,
-    /// The programs that may address the shell (see approval.rs).
+    /// The programs that may address the shell (see approval.rs). cq itself
+    /// is always one of them (see load_config): a nested shell speaks to the
+    /// terminal as its own kind through this one.
     pub control_commands: Vec<ControlCommand>,
     pub errors: Vec<ConfigError>,
     /// Every file the configuration depends on: those read, and those looked
@@ -942,6 +944,16 @@ pub fn load_config(cwd: &Path, env: &HashMap<String, String>) -> ResolvedConfig 
     config.local = problems.local.into_iter().collect();
     config.trusted = problems.trusted.into_iter().collect();
     config.untrusted = problems.untrusted;
+
+    // cq is its own control command, whatever else the configuration lists:
+    // a shell started by this one — a nested prompt — is this one's kind and
+    // must be able to speak as such through it (its `clear` asks the
+    // terminal for `clearPrompt`, which only control commands may send: see
+    // process.rs). Its own file, taken as it runs it: the nested one is the
+    // same program, however often it has been rebuilt since.
+    if let Ok(exe) = std::env::current_exe() {
+        config.control_commands.push(ControlCommand { path: exe, hash: None });
+    }
     config
 }
 
@@ -975,6 +987,9 @@ mod tests {
         assert_eq!(config.history_size, 10000);
         assert_eq!(config.prompt.vars, vec![("COLOR".to_owned(), "${HOSTNAME|hue}".to_owned())]);
         assert_eq!(config.prompt.parts.len(), 4);
+        // cq is its own control command (see load_config).
+        let exe = std::env::current_exe().unwrap();
+        assert!(config.control_commands.iter().any(|c| c.path == exe && c.hash.is_none()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

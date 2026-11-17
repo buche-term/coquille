@@ -297,6 +297,15 @@ impl Control {
             return self.declare_library(&message, json!(from)).await;
         }
 
+        // `buche_action` runs one of the terminal's interface actions on the
+        // cell this process shows: for control commands only (see
+        // approval.rs), whoever it is addressed to (it usually bubbles up to
+        // ["$term"] — through this shell, so this is where it is checked).
+        if kind(&message) == "buche_action" && !self.privileged {
+            let (cmd, what, why) = (&self.cmd, kind(&message), &self.refusal);
+            return self.error(format!("Process {id} ({cmd}) may not send {what:?}: {why}"));
+        }
+
         // Route based on `to`:
         //   ["$shell"]    → handled by this shell (see Shell::emit).
         //   ["$proc", …]  → refused: a process may not address another one.

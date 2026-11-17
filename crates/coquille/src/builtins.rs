@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-pub const BUILTIN_NAMES: &[&str] = &["cd", "set", "export", "nuke", "daemon"];
+pub const BUILTIN_NAMES: &[&str] = &["cd", "clear", "set", "export", "nuke", "daemon"];
 
 pub fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
@@ -14,6 +14,7 @@ pub fn is_builtin(name: &str) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub enum BuiltinEvent {
     Cd { path: String },
+    Clear,
     Set { name: String, value: String, export: bool },
     Nuke,
     DaemonSet { name: String, cmd: String, args: Vec<String>, restart_ms: Option<u64> },
@@ -23,7 +24,7 @@ pub enum BuiltinEvent {
 
 impl BuiltinEvent {
     /// What a control command's message to ["$shell"] asks for, if it is
-    /// one of the builtin requests: `cd` {path}, `set` {name, value,
+    /// one of the builtin requests: `cd` {path}, `clear`, `set` {name, value,
     /// export?}, `nuke`, `daemon_set` {name, cmd, args?, restartMs?},
     /// `daemon_enable` {name}, `daemon_disable` {name}. (A missing text
     /// field is empty; one that isn't a text is taken as its JSON.)
@@ -35,6 +36,7 @@ impl BuiltinEvent {
         };
         Some(match msg.get("type").and_then(Value::as_str)? {
             "cd" => BuiltinEvent::Cd { path: field("path") },
+            "clear" => BuiltinEvent::Clear,
             "set" => BuiltinEvent::Set {
                 name: field("name"),
                 value: field("value"),
@@ -56,9 +58,9 @@ impl BuiltinEvent {
     /// Whether, asked for by a message, it holds the shell's input up until
     /// it is done (see Shell::receive), rather than run as a task alongside
     /// what comes next. (Kept as it was when these requests were dispatched
-    /// by name: cd and set run as tasks.)
+    /// by name: cd, clear and set run as tasks.)
     pub fn holds_input(&self) -> bool {
-        !matches!(self, BuiltinEvent::Cd { .. } | BuiltinEvent::Set { .. })
+        !matches!(self, BuiltinEvent::Cd { .. } | BuiltinEvent::Clear | BuiltinEvent::Set { .. })
     }
 }
 
@@ -75,6 +77,12 @@ pub fn builtin_events(name: &str, args: &[String]) -> anyhow::Result<Vec<Builtin
         "cd" => {
             let path = args.first().cloned().unwrap_or_else(|| crate::util::home().to_string_lossy().into_owned());
             vec![BuiltinEvent::Cd { path }]
+        }
+        "clear" => {
+            if !args.is_empty() {
+                anyhow::bail!("usage: clear");
+            }
+            vec![BuiltinEvent::Clear]
         }
         "set" => assignments(args, false),
         "export" => assignments(args, true),
@@ -125,6 +133,8 @@ mod tests {
             vec![BuiltinEvent::DaemonSet { name: "v".into(), cmd: "watch".into(), args: s(&["-x"]), restart_ms: Some(500) }]
         );
         assert!(builtin_events("daemon", &s(&["set", "v"])).is_err());
+        assert_eq!(builtin_events("clear", &s(&[])).unwrap(), vec![BuiltinEvent::Clear]);
+        assert!(builtin_events("clear", &s(&["-x"])).is_err());
     }
 
     #[test]
@@ -139,6 +149,7 @@ mod tests {
             BuiltinEvent::DaemonSet { name: "v".into(), cmd: "w".into(), args: s(&["-x", "1"]), restart_ms: Some(5) };
         assert_eq!(BuiltinEvent::from_message(&daemon), Some(expected));
         assert_eq!(BuiltinEvent::from_message(&json!({"type": "cd"})), Some(BuiltinEvent::Cd { path: "".into() }));
+        assert_eq!(BuiltinEvent::from_message(&json!({"type": "clear"})), Some(BuiltinEvent::Clear));
         assert_eq!(BuiltinEvent::from_message(&json!({"type": "parse"})), None);
     }
 }

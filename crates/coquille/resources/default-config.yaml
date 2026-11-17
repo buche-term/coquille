@@ -91,7 +91,8 @@ history:
 
 # control-commands:
 #   The programs that may address the shell (["$shell"], on their fd 5): to
-#   submit commands, change the prompt, start daemons... Any other
+#   submit commands, change the prompt, start daemons... and to ask the
+#   terminal for one of its interface actions (buche_action). Any other
 #   program may only switch its own stdout's mode (stdout_mode). A list of
 #   {path, hash}: the file's full path (~/ is your home directory), or a
 #   bare name (e.g. sel) to find in PATH each time it runs — which file it
@@ -103,7 +104,9 @@ history:
 #   to a key, or as a daemon (`daemons`); what it starts in turn
 #   gets none, unless it relays their messages on its own channel (whatever
 #   speaks on it speaks as it). Only read from the global configuration
-#   (~/.config/cq/config.yaml). E.g.
+#   (~/.config/cq/config.yaml). cq's own executable is always one of them,
+#   whatever it holds (no hash): a nested cq can work its own prompt through
+#   this shell. E.g.
 #
 #     control-commands:
 #       - {path: sel, hash: null}

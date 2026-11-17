@@ -1,12 +1,16 @@
 //! Control commands: the programs allowed to address the shell (["$shell"]):
-//! to submit commands, change the prompt, start daemons... Any other process
-//! may only switch its own stdout's mode (see OPEN_TO_ALL).
+//! to submit commands, change the prompt, start daemons... — and to ask the
+//! terminal for an interface action (the driver's `buche_action`, see the
+//! gate in process.rs). Any other process may only switch its own stdout's
+//! mode (see OPEN_TO_ALL).
 //!
 //! They are listed in the global configuration (`control-commands`: see
 //! config.rs), as {path, hash}: the file's full path, or a bare name (no
 //! slash) to find in PATH each time it runs — so which file it is depends on
 //! PATH — and the SHA-256 of the file, or null to take it whatever it holds
-//! (a program of one's own, often changed).
+//! (a program of one's own, often changed). cq itself always joins the list,
+//! whatever the configuration holds (see config.rs): a shell started by this
+//! one is its own kind, and speaks to the terminal as such through it.
 //! A process gets the privilege when this shell starts it from a listed file
 //! (resolved as execvp would, symlinks followed) whose content matches: the
 //! shell then runs that very file (by its real path), and the privilege is

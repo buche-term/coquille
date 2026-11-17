@@ -50,6 +50,14 @@ pub fn reset(from: impl Into<Value>) -> Value {
     to_term("reset", from, Value::Null)
 }
 
+/// A `buche_action`: ask the terminal to run one of its interface actions
+/// (the ones the user's keys and menus run) on the entry the process at
+/// `from` shows. `action` is `{"id", args?}`, the id the action registry
+/// knows (buche's src/actions.ts; see its _buche_action.ts).
+pub fn buche_action(from: impl Into<Value>, action: Value) -> Value {
+    to_term("buche_action", from, json!({ "action": action }))
+}
+
 /// How something ended, for a `close`.
 pub fn outcome(success: bool, code: Option<i64>) -> Value {
     let mut outcome = json!({ "type": if success { "success" } else { "error" } });
@@ -141,6 +149,10 @@ mod tests {
         assert_eq!(
             reset(["$proc"]).to_string(),
             r#"{"type":"reset","from":["$proc"],"to":["$term"]}"#
+        );
+        assert_eq!(
+            buche_action(SELF, json!({ "id": "clearPrompt" })).to_string(),
+            r#"{"type":"buche_action","from":["$proc","cq"],"to":["$term"],"action":{"id":"clearPrompt"}}"#
         );
         assert_eq!(
             prompt_configure(json!({ "focus": true })).to_string(),

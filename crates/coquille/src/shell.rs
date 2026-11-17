@@ -1102,6 +1102,24 @@ impl Shell {
         Ok(())
     }
 
+    /// `clear`: have the terminal clear this prompt's finished cells —
+    /// `clearPrompt`, one of the interface's own actions, run by its driver's
+    /// `buche_action` (see buche's src/driver-exchange/_buche_action.ts) on
+    /// the entry we show: our prompt. Under an enclosing shell, the message
+    /// bubbles up through it with our address qualified — it lands on our
+    /// prompt there too, and only control commands may send it (see
+    /// process.rs): which this shell always is for a nested `cq` (see
+    /// config.rs).
+    fn handle_clear(self: &Rc<Self>) {
+        let ask = protocol::buche_action(SELF, json!({ "id": "clearPrompt" }));
+        // Run as a builtin, this goes out after our own cell has closed
+        // (the task is only polled once run_builtin_cell is done): a
+        // finished cell by then, `clearPrompt` clears it with the rest of
+        // the stream, leaving nothing of `clear` itself in it.
+        let shell = self.clone();
+        spawn_local(async move { shell.emit(ask) });
+    }
+
     fn handle_set(self: &Rc<Self>, name: &str, value: &str, export: bool) {
         if export {
             self.export_var(name, value);
@@ -1580,6 +1598,7 @@ impl Shell {
     fn perform(self: &Rc<Self>, event: BuiltinEvent, process_id: Option<&str>) -> Result<()> {
         match event {
             BuiltinEvent::Cd { path } => self.handle_cd(&path, process_id)?,
+            BuiltinEvent::Clear => self.handle_clear(),
             BuiltinEvent::Set { name, value, export } => self.handle_set(&name, &value, export),
             BuiltinEvent::Nuke => self.kill_all(),
             BuiltinEvent::DaemonSet {
