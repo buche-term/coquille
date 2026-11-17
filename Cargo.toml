@@ -6,7 +6,7 @@ members = ["crates/*"]
 edition = "2024"
 version = "0.0.1"
 license = "MIT"
-repository = "https://github.com/breuleux/coquille"
+repository = "https://github.com/buche-term/coquille"
 
 [profile.release]
 strip = true
